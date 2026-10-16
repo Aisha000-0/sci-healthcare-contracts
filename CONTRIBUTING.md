@@ -83,7 +83,7 @@ A bot merges pull requests automatically (squash) as soon as every CI check on t
 
 - is not a draft and has no `do-not-merge` label,
 - has no merge conflicts and is up to date with `main` (the bot comments if it is behind),
-- and, if it changes CI configuration, deployment settings or dependency manifests, has been approved by a maintainer. The exact paths are listed in `.github/workflows/automerge.yml`; the bot comments with the files that need approval.
+- and, if it changes anything under `.github/` (CI workflows and repository automation), has been approved by a maintainer. The bot comments with the files that need approval.
 
 So open your pull request as a draft until it is ready, and keep CI green. To stop an automatic merge, add the `do-not-merge` label or convert the pull request back to a draft.
 
