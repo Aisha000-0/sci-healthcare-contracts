@@ -220,6 +220,8 @@ impl VoucherEscrow {
             provider,
             voucher_id,
             claimed_at: now,
+            service_code: voucher.service_code,
+            amount: voucher.amount,
         }
         .publish(&env);
         Ok(())
@@ -262,6 +264,8 @@ impl VoucherEscrow {
             voucher_id,
             attested_at: now,
             dispute_deadline: voucher.dispute_deadline,
+            service_code: voucher.service_code,
+            amount: voucher.amount,
         }
         .publish(&env);
         Ok(())
@@ -302,6 +306,8 @@ impl VoucherEscrow {
             funder,
             voucher_id,
             reason_code,
+            service_code: voucher.service_code,
+            amount: voucher.amount,
         }
         .publish(&env);
         Ok(())
@@ -511,6 +517,8 @@ impl VoucherEscrow {
             voucher_id: voucher.id,
             net,
             fee,
+            service_code: voucher.service_code,
+            amount: voucher.amount,
         }
         .publish(env);
         Ok(())
@@ -532,6 +540,7 @@ impl VoucherEscrow {
             funder: voucher.funder.clone(),
             voucher_id: voucher.id,
             amount: voucher.amount,
+            service_code: voucher.service_code,
         }
         .publish(env);
     }

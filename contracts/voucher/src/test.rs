@@ -797,3 +797,246 @@ fn non_admin_cannot_propose_admin() {
         .unwrap();
     assert_eq!(err, VoucherError::NotAuthorized);
 }
+
+// ----- event snapshots -----
+//
+// Every lifecycle event must carry what was paid for — `service_code` and
+// `amount` — so an indexer or wallet reading a single event can describe it
+// without a storage lookup. `VoucherCreated` already did; claim, attest,
+// dispute, settle and refund now do too. These tests read the decoded XDR
+// event itself (the same bytes a snapshot records and an indexer decodes),
+// and run offline like the rest of the suite.
+
+extern crate std;
+
+use soroban_sdk::testutils::Events as _;
+use soroban_sdk::xdr::{ContractEvent, ContractEventBody, ScVal};
+use std::vec::Vec;
+
+/// The single event published by the last invocation, from this contract.
+///
+/// `settle` and `refund` move tokens first, so the SAC's own `transfer`
+/// event is in the same list; the voucher event is what is under test.
+/// A descriptive message beats a wrong-but-passing assertion: if the call
+/// published nothing, or something else entirely, the failure says so.
+fn one_event(f: &Fixture) -> ContractEvent {
+    let events = f.env.events().all().filter_by_contract(&f.voucher.address);
+    let list = events.events();
+    assert_eq!(
+        list.len(),
+        1,
+        "expected the invocation to publish exactly one voucher event, got {:?}",
+        list,
+    );
+    list[0].clone()
+}
+
+/// Topics of the event, as published (topic 0 is the event name).
+fn topics(e: &ContractEvent) -> &[ScVal] {
+    match &e.body {
+        ContractEventBody::V0(v0) => &v0.topics,
+    }
+}
+
+/// The event's data map, or `None` when it is not a map.
+fn data(e: &ContractEvent) -> Option<&soroban_sdk::xdr::VecM<soroban_sdk::xdr::ScMapEntry>> {
+    let data = match &e.body {
+        ContractEventBody::V0(v0) => &v0.data,
+    };
+    match data {
+        ScVal::Map(Some(map)) => Some(map),
+        _ => None,
+    }
+}
+
+/// The text of a `Symbol` value, or `None` when it is not one.
+fn symbol(v: &ScVal) -> Option<&str> {
+    match v {
+        ScVal::Symbol(s) => (&s.0).try_into().ok(),
+        _ => None,
+    }
+}
+
+/// One field of the data map, with a descriptive failure when it is
+/// missing or has the wrong XDR type.
+fn field(e: &ContractEvent, name: &str) -> ScVal {
+    let entries = data(e).unwrap_or_else(|| panic!("event data is not a map: {:?}", e));
+    let found = entries
+        .iter()
+        .find(|entry| symbol(&entry.key) == Some(name))
+        .unwrap_or_else(|| {
+            let keys: Vec<&str> = entries
+                .iter()
+                .filter_map(|entry| symbol(&entry.key))
+                .collect();
+            panic!(
+                "event has no {name} field; its fields are {keys:?}: {:?}",
+                e
+            )
+        });
+    found.val.clone()
+}
+
+fn field_u32(e: &ContractEvent, name: &str) -> u32 {
+    match field(e, name) {
+        ScVal::U32(v) => v,
+        other => panic!("event field {name} is {other:?}, want u32"),
+    }
+}
+
+fn field_u64(e: &ContractEvent, name: &str) -> u64 {
+    match field(e, name) {
+        ScVal::U64(v) => v,
+        other => panic!("event field {name} is {other:?}, want u64"),
+    }
+}
+
+fn field_i128(e: &ContractEvent, name: &str) -> i128 {
+    match field(e, name) {
+        ScVal::I128(parts) => i128::from(&parts),
+        other => panic!("event field {name} is {other:?}, want i128"),
+    }
+}
+
+/// The declared fields present on the event, in the order the data map
+/// carries them (an XDR map is sorted by key, so this is stable).
+fn field_names(e: &ContractEvent) -> Vec<&str> {
+    let Some(entries) = data(e) else {
+        panic!("event data is not a map: {e:?}");
+    };
+    entries
+        .iter()
+        .filter_map(|entry| symbol(&entry.key))
+        .collect()
+}
+
+/// The event name (topic 0) and its first topic, which is always the
+/// acting address for these lifecycle events.
+fn assert_name_and_topic(e: &ContractEvent, want_name: &str) {
+    assert_eq!(
+        symbol(topics(e).first().expect("event has no topics")),
+        Some(want_name),
+        "topic 0 names the event, got {:?}",
+        topics(e),
+    );
+    assert!(
+        matches!(topics(e).get(1), Some(ScVal::Address(_))),
+        "topic 1 of {want_name} is the acting address, got {:?}",
+        topics(e),
+    );
+}
+
+#[test]
+fn claim_event_snapshot_carries_service_and_amount() {
+    let f = setup();
+    let id = fund(&f);
+
+    f.voucher.claim(&f.provider, &id);
+
+    let e = one_event(&f);
+    assert_name_and_topic(&e, "voucher_claimed");
+    assert_eq!(field_u64(&e, "voucher_id"), id);
+    assert_eq!(field_u64(&e, "claimed_at"), START_TIME);
+    assert_eq!(field_u32(&e, "service_code"), CONSULT);
+    assert_eq!(field_i128(&e, "amount"), CONSULT_PRICE);
+    assert_eq!(
+        field_names(&e),
+        ["amount", "claimed_at", "service_code", "voucher_id"],
+    );
+}
+
+#[test]
+fn attest_event_snapshot_carries_service_and_amount() {
+    let f = setup();
+    let id = fund(&f);
+    f.voucher.claim(&f.provider, &id);
+
+    f.voucher.attest(&f.attester, &id);
+
+    let e = one_event(&f);
+    assert_name_and_topic(&e, "voucher_attested");
+    assert_eq!(field_u64(&e, "voucher_id"), id);
+    assert_eq!(field_u64(&e, "attested_at"), START_TIME);
+    assert_eq!(
+        field_u64(&e, "dispute_deadline"),
+        START_TIME + DISPUTE_WINDOW
+    );
+    assert_eq!(field_u32(&e, "service_code"), CONSULT);
+    assert_eq!(field_i128(&e, "amount"), CONSULT_PRICE);
+    assert_eq!(
+        field_names(&e),
+        [
+            "amount",
+            "attested_at",
+            "dispute_deadline",
+            "service_code",
+            "voucher_id",
+        ],
+    );
+}
+
+#[test]
+fn dispute_event_snapshot_carries_service_and_amount() {
+    let f = setup();
+    let id = fund(&f);
+    f.voucher.claim(&f.provider, &id);
+
+    // Reason 1: the provider took the voucher but never delivered.
+    f.voucher.dispute(&f.funder, &id, &1);
+
+    let e = one_event(&f);
+    assert_name_and_topic(&e, "voucher_disputed");
+    assert_eq!(field_u64(&e, "voucher_id"), id);
+    assert_eq!(field_u32(&e, "reason_code"), 1);
+    assert_eq!(field_u32(&e, "service_code"), CONSULT);
+    assert_eq!(field_i128(&e, "amount"), CONSULT_PRICE);
+    assert_eq!(
+        field_names(&e),
+        ["amount", "reason_code", "service_code", "voucher_id"],
+    );
+}
+
+#[test]
+fn settle_event_snapshot_carries_service_and_amount() {
+    let f = setup();
+    let id = fund(&f);
+    f.voucher.claim(&f.provider, &id);
+    f.voucher.attest(&f.attester, &id);
+    advance(&f.env, DISPUTE_WINDOW + 1);
+    // Quoted before settling: `one_event` reads the *last* invocation.
+    let (fee, net) = f.voucher.quote(&CONSULT_PRICE);
+
+    f.voucher.settle(&id);
+
+    let e = one_event(&f);
+    assert_name_and_topic(&e, "voucher_settled");
+    assert_eq!(field_u64(&e, "voucher_id"), id);
+    assert_eq!(field_i128(&e, "net"), net);
+    assert_eq!(field_i128(&e, "fee"), fee);
+    // The gross escrow sits beside the payout, so one event answers both
+    // "what was paid" and "what landed".
+    assert_eq!(field_i128(&e, "net") + field_i128(&e, "fee"), CONSULT_PRICE);
+    assert_eq!(field_u32(&e, "service_code"), CONSULT);
+    assert_eq!(field_i128(&e, "amount"), CONSULT_PRICE);
+    assert_eq!(
+        field_names(&e),
+        ["amount", "fee", "net", "service_code", "voucher_id"],
+    );
+}
+
+#[test]
+fn refund_event_snapshot_carries_service_and_amount() {
+    let f = setup();
+    let id = fund(&f);
+    // The voucher runs to expiry unclaimed; no care happened.
+    advance(&f.env, 30 * 24 * 60 * 60 + 1);
+
+    f.voucher.refund(&id);
+
+    let e = one_event(&f);
+    assert_name_and_topic(&e, "voucher_refunded");
+    assert_eq!(field_u64(&e, "voucher_id"), id);
+    assert_eq!(field_i128(&e, "amount"), CONSULT_PRICE);
+    assert_eq!(field_u32(&e, "service_code"), CONSULT);
+    assert_eq!(field_names(&e), ["amount", "service_code", "voucher_id"],);
+}

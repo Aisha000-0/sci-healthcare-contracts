@@ -36,6 +36,10 @@ pub struct VoucherClaimed {
     pub provider: Address,
     pub voucher_id: u64,
     pub claimed_at: u64,
+    /// Appended, after the original fields: what was claimed, in the
+    /// voucher's own event, so a single event needs no storage lookup.
+    pub service_code: u32,
+    pub amount: i128,
 }
 
 #[contractevent]
@@ -46,6 +50,9 @@ pub struct VoucherAttested {
     pub voucher_id: u64,
     pub attested_at: u64,
     pub dispute_deadline: u64,
+    /// Appended, after the original fields; see `VoucherClaimed`.
+    pub service_code: u32,
+    pub amount: i128,
 }
 
 #[contractevent]
@@ -55,6 +62,9 @@ pub struct VoucherDisputed {
     pub funder: Address,
     pub voucher_id: u64,
     pub reason_code: u32,
+    /// Appended, after the original fields; see `VoucherClaimed`.
+    pub service_code: u32,
+    pub amount: i128,
 }
 
 #[contractevent]
@@ -65,6 +75,10 @@ pub struct VoucherSettled {
     pub voucher_id: u64,
     pub net: i128,
     pub fee: i128,
+    /// Appended, after the original fields: the gross amount escrowed,
+    /// beside the `net` and `fee` that were paid out.
+    pub service_code: u32,
+    pub amount: i128,
 }
 
 #[contractevent]
@@ -73,7 +87,11 @@ pub struct VoucherRefunded {
     #[topic]
     pub funder: Address,
     pub voucher_id: u64,
+    /// Already carried by this event; left where it is so existing
+    /// consumers keep reading the same field.
     pub amount: i128,
+    /// Appended, after the original fields; see `VoucherClaimed`.
+    pub service_code: u32,
 }
 
 #[contractevent]
