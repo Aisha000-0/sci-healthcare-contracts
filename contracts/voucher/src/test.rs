@@ -798,6 +798,63 @@ fn non_admin_cannot_propose_admin() {
     assert_eq!(err, VoucherError::NotAuthorized);
 }
 
+#[test]
+fn multisig_admin_can_act_on_all_three_contracts() {
+    // A Stellar account with several signers is still one `Address` to
+    // Soroban: the network enforces the signer weights and 2-of-3 threshold,
+    // and the contract only sees the G-account that authorised the call. This
+    // test hands every contract to that account and proves each one accepts
+    // its admin calls, which is what `docs/developers/multisig-admin.md`
+    // sets up on testnet.
+    let f = setup();
+    let multisig = Address::from_string(&String::from_str(
+        &f.env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ));
+
+    f.registry.propose_admin(&f.admin, &multisig);
+    f.receipts.propose_admin(&f.admin, &multisig);
+    f.voucher.propose_admin(&f.admin, &multisig);
+
+    // Nothing changes until the nominee accepts.
+    assert_eq!(f.registry.get_admin(), f.admin);
+    assert_eq!(f.receipts.get_admin(), f.admin);
+    assert_eq!(f.voucher.get_config().admin, f.admin);
+
+    f.registry.accept_admin(&multisig);
+    f.receipts.accept_admin(&multisig);
+    f.voucher.accept_admin(&multisig);
+
+    assert_eq!(f.registry.get_admin(), multisig);
+    assert_eq!(f.receipts.get_admin(), multisig);
+    assert_eq!(f.voucher.get_config().admin, multisig);
+
+    // Registry: an ordinary admin action.
+    let new_attester = Address::generate(&f.env);
+    f.registry.add_attester(&multisig, &new_attester);
+    assert!(f.registry.is_attester(&new_attester));
+
+    // Registry: suspend and restore the provider through the same account.
+    f.registry
+        .set_provider_status(&multisig, &f.provider, &ProviderStatus::Suspended);
+    assert!(!f.registry.is_active_provider(&f.provider));
+    f.registry
+        .set_provider_status(&multisig, &f.provider, &ProviderStatus::Active);
+
+    // Receipt book: repoint the minter, then put it back for the voucher.
+    let new_minter = Address::generate(&f.env);
+    f.receipts.set_minter(&multisig, &new_minter);
+    assert_eq!(f.receipts.get_minter(), new_minter);
+    f.receipts.set_minter(&multisig, &f.voucher.address);
+
+    // Voucher: resolve a real dispute as the multisig admin.
+    let id = fund(&f);
+    f.voucher.claim(&f.provider, &id);
+    f.voucher.dispute(&f.funder, &id, &1u32);
+    f.voucher.resolve_dispute(&multisig, &id, &true);
+    assert_eq!(f.voucher.get_voucher(&id).status, VoucherStatus::Refunded);
+}
+
 // ----- event snapshots -----
 //
 // Every lifecycle event must carry what was paid for — `service_code` and

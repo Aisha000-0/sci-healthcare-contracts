@@ -19,5 +19,8 @@
 
 * [Local setup](developers/setup.md)
 * [Contract reference](developers/contracts.md)
+* [Integrating from another app](developers/integration.md)
+* [Using a multisig admin](developers/multisig-admin.md)
+* [Mainnet launch checklist](developers/mainnet-checklist.md)
 * [API reference](developers/api.md)
 * [Contributing](developers/contributing.md)

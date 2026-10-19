@@ -5,7 +5,8 @@
 **These contracts and services are unaudited.** They have not been reviewed by a
 third-party security firm. The current deployment is on Stellar **testnet** only
 and holds no real funds. Do not deploy to mainnet or use with real value until an
-audit has been completed.
+audit has been completed and the
+[mainnet launch checklist](docs/developers/mainnet-checklist.md) is signed off.
 
 ## Reporting a vulnerability
 

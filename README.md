@@ -12,7 +12,7 @@
   <img src="https://img.shields.io/badge/soroban--sdk-27.0.6-blue" alt="soroban-sdk 27.0.6" />
   <img src="https://img.shields.io/badge/rust-1.96-orange" alt="rust 1.96" />
   <img src="https://img.shields.io/badge/license-Apache--2.0-green" alt="Apache 2.0" />
-  <img src="https://img.shields.io/badge/tests-99%20passing-brightgreen" alt="99 tests" />
+  <img src="https://img.shields.io/badge/tests-100%20passing-brightgreen" alt="100 tests" />
 </p>
 
 # SCI Healthcare — Contracts | [Documentation](https://godgift-care.github.io/sci-healthcare-contracts/)
@@ -86,7 +86,7 @@ It fetches each deployed wasm with `stellar contract fetch` and compares it with
 Two separate things are going on, and only one of them is a problem:
 
 - **The bytes differ everywhere, and that is expected.** The contracts on testnet were deployed from an older commit, built on a Windows machine with an unpinned pipeline. The Soroban SDK embeds the absolute path of its own source in its panic messages, so those artefacts carry that machine's paths and a different internal layout. [`scripts/build-wasm.sh`](scripts/build-wasm.sh) now pins the toolchain, takes the local path out of the artefact and optimises with the same `wasm-opt` the release uses, so a build made with it is byte-identical for every builder that uses the same toolchain and the same platform. The contracts on testnet predate that.
-- **The voucher is genuinely older than this repository.** Its lifecycle events do not carry `service_code` and `amount` yet; that change is in the source but was never deployed. Redeploying the voucher with `scripts/deploy.sh` makes it match.
+- **The voucher is genuinely older than this repository.** Its lifecycle events do not carry `service_code` and `amount` yet; that change is in the source but was never deployed. Redeploying the voucher with `./scripts/deploy.sh testnet --force` makes it match.
 
 The full recipe, and what "byte-identical" does and does not cover, is in [docs/developers/contracts.md](docs/developers/contracts.md).
 
@@ -151,7 +151,7 @@ cargo install --locked wasm-opt   # or download the binaryen release above
 ```bash
 git clone https://github.com/Godgift-care/sci-healthcare-contracts
 cd sci-healthcare-contracts
-cargo test                                    # 99 tests
+cargo test                                    # 100 tests
 cargo build --target wasm32v1-none --release  # three .wasm artifacts
 ./scripts/build-wasm.sh                       # the release build: optimised wasm + SHA256SUMS
 ```
@@ -166,12 +166,13 @@ follows.
 ```bash
 stellar keys generate --network testnet --fund sci-admin
 stellar keys generate --network testnet --fund sci-issuer
-./scripts/deploy.sh testnet     # deploys in dependency order and wires them up
-./scripts/seed.sh testnet       # demo clinic, services, attester, vouchers
-./scripts/deploy-faucet.sh      # testnet only: lets anyone get test USDC
+./scripts/deploy.sh testnet --dry-run   # preview every command; sends nothing
+./scripts/deploy.sh testnet             # deploys in dependency order and wires them up
+./scripts/seed.sh testnet               # demo clinic, services, attester, vouchers
+./scripts/deploy-faucet.sh              # testnet only: lets anyone get test USDC
 ```
 
-`deploy.sh` writes every address to `deployments/testnet.env` and prints a copy-pasteable block for the app's environment.
+`deploy.sh` writes every address to `deployments/testnet.env` and prints a copy-pasteable block for the app's environment. It refuses to overwrite an existing env file unless you pass `--force`, because replacing live addresses breaks the app and indexer. `scripts/test-deploy.sh` tests the refusal, `--force` and `--dry-run` paths.
 
 ## What CI checks
 
@@ -179,10 +180,11 @@ stellar keys generate --network testnet --fund sci-issuer
 | --- | --- |
 | `cargo fmt --all -- --check` | formatting drift |
 | `cargo clippy --all-targets --all-features -- -D warnings` | lint warnings |
-| `cargo test --all` | broken behaviour (99 tests) |
+| `cargo test --all` | broken behaviour (100 tests) |
 | `cargo llvm-cov` | contract lines the tests never reach |
 | `cargo deny check` | dependencies with a known advisory or an incompatible licence |
 | `./scripts/build-wasm.sh` | a contract that no longer compiles to wasm |
+| `./scripts/test-deploy.sh` | deploy-script overwrite, `--force` and `--dry-run` regressions |
 
 **Coverage.** The `coverage` job prints the coverage table in the job output
 and fails when the contract sources drop below the threshold. Today the
@@ -246,6 +248,23 @@ deployed contract.
 | `count_for(beneficiary_ref)` | view | Settled episodes for a beneficiary |
 
 There is deliberately no transfer function on receipts.
+
+## Mainnet readiness
+
+The contracts are **unaudited** and the only deployment is on testnet. Before
+mainnet, every gate in the [mainnet launch checklist](docs/developers/mainnet-checklist.md)
+must be signed off with an owner and evidence: audit, code freeze, key custody,
+fee and dispute parameters, monitoring, incident contacts and rollback.
+
+The admin should be a 2-of-3 Stellar multisig account, not one key. The
+[multisig admin guide](docs/developers/multisig-admin.md) creates it, hands all
+three contracts to it through the two-step `propose_admin` / `accept_admin`
+handover, and shows how to submit an admin call with two signatures.
+
+Wallets and remittance apps can add care vouchers without this UI. The
+[integration guide](docs/developers/integration.md) covers deriving a
+beneficiary reference without leaking identity, quoting fees, funding, reading
+status and reading receipts with the JavaScript SDK.
 
 ## Related repositories
 
