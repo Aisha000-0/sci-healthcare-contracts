@@ -172,14 +172,16 @@ pub struct Voucher {
 | Event | Topics | Data |
 | --- | --- | --- |
 | `voucher_created` | `funder`, `provider`, `beneficiary_ref` | `voucher_id`, `service_code`, `amount`, `created_at`, `expires_at` |
-| `voucher_claimed` | `provider` | `voucher_id`, `claimed_at` |
-| `voucher_attested` | `attester` | `voucher_id`, `attested_at`, `dispute_deadline` |
-| `voucher_disputed` | `funder` | `voucher_id`, `reason_code` |
-| `voucher_settled` | `provider` | `voucher_id`, `net`, `fee` |
-| `voucher_refunded` | `funder` | `voucher_id`, `amount` |
+| `voucher_claimed` | `provider` | `voucher_id`, `claimed_at`, `service_code`, `amount` |
+| `voucher_attested` | `attester` | `voucher_id`, `attested_at`, `dispute_deadline`, `service_code`, `amount` |
+| `voucher_disputed` | `funder` | `voucher_id`, `reason_code`, `service_code`, `amount` |
+| `voucher_settled` | `provider` | `voucher_id`, `net`, `fee`, `service_code`, `amount` |
+| `voucher_refunded` | `funder` | `voucher_id`, `amount`, `service_code` |
 | `dispute_resolved` | `admin` | `voucher_id`, `refunded_funder` |
 
 > Fields listed under **Topics** are published in the event's topic list, **not** in its data map. An indexer reading them off the data map gets `undefined`.
+>
+> Every lifecycle event now carries `service_code` and `amount`, appended **after** the fields each event already had, so one event says what was paid for without a storage lookup. The data map is keyed by field name (an XDR `ScMap`), and existing fields keep their positions: decoders that read by name — including `sci-healthcare-backend` — pick the new fields up without a breaking change. `voucher_refunded` already carried `amount`; it gains `service_code` only.
 
 ---
 
