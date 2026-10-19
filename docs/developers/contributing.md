@@ -1,6 +1,6 @@
 ---
 title: Contributing
-nav_order: 12
+nav_order: 15
 ---
 
 # Contributing to SCI Healthcare Contracts

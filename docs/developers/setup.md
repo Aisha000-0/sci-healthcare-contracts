@@ -37,7 +37,7 @@ cargo install --locked wasm-opt   # or download binaryen 133 from GitHub release
 git clone https://github.com/Godgift-care/sci-healthcare-contracts
 cd sci-healthcare-contracts
 
-cargo test                                    # 99 tests
+cargo test                                    # 100 tests
 cargo build --target wasm32v1-none --release
 ./scripts/build-wasm.sh                       # the release build: optimised wasm + SHA256SUMS
 ```
@@ -54,11 +54,12 @@ for id in sci-admin sci-issuer sci-clinic sci-attester sci-funder; do
   stellar keys generate --network testnet --fund $id
 done
 
-./scripts/deploy.sh testnet
+./scripts/deploy.sh testnet --dry-run   # preview every command; sends nothing
+./scripts/deploy.sh testnet             # writes deployments/testnet.env
 ./scripts/seed.sh testnet
 ```
 
-`deploy.sh` deploys in dependency order — registry and receipt first, then voucher — initialises each, points the receipt book at the voucher contract, and writes every address to `deployments/testnet.env`.
+`deploy.sh` deploys in dependency order — registry and receipt first, then voucher — initialises each, points the receipt book at the voucher contract, and writes every address to `deployments/testnet.env`. Re-running it refuses to overwrite an existing env file unless you pass `--force`; use `--dry-run` to preview without building, deploying or sending a transaction. `scripts/test-deploy.sh` covers both behaviours.
 
 `seed.sh` creates a demo clinic with three services, authorises an attester, and funds two vouchers.
 

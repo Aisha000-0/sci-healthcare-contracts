@@ -149,7 +149,7 @@ pub struct Voucher {
 
 **`refund`** — status is `Funded` and now ≥ `expires_at`, or status is `Claimed` and now ≥ `expires_at + CLAIM_GRACE_SECS` (7 days). Returns the full amount, no fee. `refundable_at` returns the exact time.
 
-**`propose_admin` / `accept_admin`** — two-step handover, identical in all three contracts. Proposing again replaces the nominee; nothing changes until the nominee signs `accept_admin`.
+**`propose_admin` / `accept_admin`** — two-step handover, identical in all three contracts. Proposing again replaces the nominee; nothing changes until the nominee signs `accept_admin`. On mainnet, hand admin to a 2-of-3 Stellar multisig account rather than a single key; see [Using a multisig admin](multisig-admin.md).
 
 **`resolve_dispute`** — caller is admin; status is `Disputed`. Routes to funder or provider; no third destination exists.
 
@@ -296,7 +296,35 @@ existed. They carry that machine's paths, so a fresh build does not reproduce
 their bytes even though it exposes exactly the same interface. The voucher is
 further behind: its lifecycle events do not carry `service_code` and `amount`
 yet, so the deployed voucher is not the one in this repository. Redeploying
-with `scripts/deploy.sh` fixes both.
+with `./scripts/deploy.sh testnet --force` fixes both.
+
+### Deploying safely
+
+`scripts/deploy.sh` refuses to replace an existing
+`deployments/<network>.env` unless you pass `--force`, because replacing live
+addresses breaks every app and indexer pointed at them. Preview first:
+
+```bash
+./scripts/deploy.sh testnet --dry-run   # prints every command, sends nothing
+./scripts/deploy.sh testnet             # first deployment
+./scripts/deploy.sh testnet --force     # intentional replacement
+```
+
+The dry run does not build, call `stellar`, write the env file or send a
+transaction. It prints the commands with visible placeholders for the ids it
+would discover. `scripts/test-deploy.sh` exercises the refusal, `--force` and
+`--dry-run` paths without a network.
+
+`deploy.sh` is a **testnet** tool: it deploys a test USDC asset from the
+`$ISSUER` identity. It is not the mainnet deployment procedure. Do not point it
+at mainnet; use the reviewed process in the [mainnet launch checklist](mainnet-checklist.md).
+
+### Integrating from another app
+
+Wallets and remittance apps can call the contracts directly. The
+[integration guide](integration.md) has runnable JavaScript for deriving a
+beneficiary reference, quoting the fee, funding a voucher, reading its status
+and reading receipts.
 
 ### The release
 
@@ -365,3 +393,10 @@ Run it locally with:
 cargo install --locked cargo-deny --version 0.20.2
 cargo deny check
 ```
+
+### Before mainnet
+
+The contracts are unaudited and have only run on testnet. The
+[mainnet launch checklist](mainnet-checklist.md) lists the code, key,
+parameter, monitoring, communication and rollback gates, each with an owner and
+the evidence required. Do not deploy to mainnet until it is signed off.
