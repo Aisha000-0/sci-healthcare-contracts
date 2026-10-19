@@ -5,7 +5,12 @@
 #
 # Usage:  ./scripts/deploy.sh [network]     (default: testnet)
 #
-# Requires: stellar CLI >= 27, a funded source identity named $ADMIN.
+# Requires: stellar CLI >= 27, wasm-opt (binaryen 133), a funded source
+# identity named $ADMIN.
+#
+# The contracts are built by scripts/build-wasm.sh, the same script the
+# release workflow uses, so what is deployed is what is released and
+# scripts/verify-deployments.sh can check it.
 
 set -euo pipefail
 
@@ -16,7 +21,7 @@ DISPUTE_WINDOW="${DISPUTE_WINDOW:-259200}"   # 72 hours, in seconds
 FEE_BPS="${FEE_BPS:-100}"                    # 1%
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WASM_DIR="$ROOT/target/wasm32v1-none/release"
+WASM_DIR="$ROOT/dist"
 OUT="$ROOT/deployments/$NETWORK.env"
 mkdir -p "$(dirname "$OUT")"
 
@@ -26,7 +31,8 @@ ADMIN_ADDR="$(stellar keys address "$ADMIN")"
 ISSUER_ADDR="$(stellar keys address "$ISSUER")"
 
 say "Building contracts"
-(cd "$ROOT" && cargo build --target wasm32v1-none --release)
+"$ROOT/scripts/build-wasm.sh" "$WASM_DIR" >/dev/null
+cat "$WASM_DIR/SHA256SUMS"
 
 say "Deploying settlement token (USDC test asset)"
 stellar contract asset deploy \

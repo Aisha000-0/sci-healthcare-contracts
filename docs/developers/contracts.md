@@ -256,3 +256,112 @@ On testnet the faucet drips 50 USDC once a day: [`CCB25WG7DQ2CSNXPTOHZO2PDZ324FQ
 | 3 | `NotAuthorized` |
 | 4 | `InvalidAmount` |
 | 5 | `CoolingDown` |
+
+---
+
+## Building, releasing and verifying the contracts
+
+### The build
+
+`scripts/build-wasm.sh` is the build. The release workflow, `scripts/deploy.sh`
+and `scripts/verify-deployments.sh` all call it, so the wasm that is released,
+the wasm that is deployed and the wasm a verifier builds are the same bytes.
+
+```bash
+./scripts/build-wasm.sh          # writes dist/*.wasm and dist/SHA256SUMS
+```
+
+Four rules make that possible, and every one of them is a trap if it is
+ignored:
+
+| Rule | Why |
+| --- | --- |
+| The toolchain is pinned in `rust-toolchain.toml` (1.96.0) | a different rustc emits different code |
+| The release profile is fixed in the workspace `Cargo.toml` (`opt-level = "z"`, `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = "symbols"`) | different flags mean different bytes |
+| The **whole workspace** is built in one cargo invocation | cargo unifies features per package, so `cargo build -p sci-registry` links a different `soroban-sdk` than `cargo build` and produces different bytes |
+| The cargo registry path is remapped out of the artefact (`--remap-path-prefix`) | the Soroban SDK embeds the absolute path of its own source in its panic messages, so without this the wasm carries the builder's home directory |
+| The result is optimised with `wasm-opt -Oz` (binaryen 133) | the release pins the optimiser version, so the optimised bytes do not change under us |
+
+**What "reproducible" covers.** Two builders that use the same toolchain, the
+same profile and the same host platform get the same bytes: the same source
+built in two different directories, and inside the pinned `rust:1.96.0`
+container, both produce identical wasm. It does **not** cover a build on a
+different operating system: some dependencies in the tree behave differently
+when they are compiled on Windows, which changes the order of a few internal
+helper functions in the wasm.
+
+**What is on testnet today.** The contracts on testnet were deployed from an
+older commit, built on the maintainer's Windows machine before this recipe
+existed. They carry that machine's paths, so a fresh build does not reproduce
+their bytes even though it exposes exactly the same interface. The voucher is
+further behind: its lifecycle events do not carry `service_code` and `amount`
+yet, so the deployed voucher is not the one in this repository. Redeploying
+with `scripts/deploy.sh` fixes both.
+
+### The release
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which tests, builds
+and attaches to the GitHub release:
+
+- `sci_registry.wasm`, `sci_voucher.wasm`, `sci_receipt.wasm`, `sci_faucet.wasm` — the optimised contracts,
+- `SHA256SUMS` — the SHA-256 of every file,
+- release notes that explain how to compare the hash with a deployed contract.
+
+Comparing a deployed contract with a release is one command:
+
+```bash
+stellar contract info hash --contract-id <CONTRACT_ID> --network testnet
+grep sci_voucher SHA256SUMS
+```
+
+The two hashes must be identical.
+
+### The check
+
+```bash
+./scripts/verify-deployments.sh testnet
+```
+
+For every contract in `deployments/testnet.env` the script fetches the
+deployed wasm with `stellar contract fetch` and compares it with the local
+build twice:
+
+- **hash** — the SHA-256 of the whole file. Equal hashes mean the deployed
+  bytes are the bytes this source produces.
+- **interface** — the contract interface (functions, types, errors and events)
+  as the Stellar host reads it, through `stellar contract info interface`.
+  Equal interfaces mean the deployed contract behaves like the source even when
+  the bytes differ.
+
+The script exits non-zero when either differs. `--wasm-dir DIR` compares
+against wasm files you already have (the artefacts from a release, for
+example) instead of building; `--skip-build` reuses what is already in that
+directory.
+
+### Coverage
+
+CI measures coverage with `cargo llvm-cov` and fails when it drops. The
+contract sources are at **98.14% of lines** and **95.99% of regions**; the
+thresholds in `.github/workflows/ci.yml` sit just under, at 98% and 95%. Test
+files are excluded from the measurement: the number that matters is how much of
+the contract code the tests reach. Raise the threshold in the same pull
+request that adds the tests.
+
+### Dependencies
+
+`cargo deny check` runs in CI against the policy in `deny.toml`: the RustSec
+advisory database, the licence allow list, the duplicate and wildcard bans and
+the source allow list. There are no exceptions today. If one is needed, it has
+to carry a reason:
+
+```toml
+[advisories]
+ignore = [{ id = "RUSTSEC-0000-0000", reason = "why this does not apply" }]
+```
+
+Run it locally with:
+
+```bash
+cargo install --locked cargo-deny --version 0.20.2
+cargo deny check
+```

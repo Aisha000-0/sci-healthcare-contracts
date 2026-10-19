@@ -20,6 +20,7 @@ Three repositories. Build them in this order — the app needs contract addresse
 | Rust | 1.96.0 |
 | wasm target | `wasm32v1-none` |
 | Stellar CLI | 27.0.0+ |
+| wasm-opt (binaryen) | 133 |
 | Node | 22 LTS |
 
 ```bash
@@ -27,6 +28,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 rustup toolchain install 1.96.0
 rustup target add wasm32v1-none
 cargo install --locked stellar-cli
+cargo install --locked wasm-opt   # or download binaryen 133 from GitHub releases
 ```
 
 ## 1. Contracts
@@ -35,9 +37,15 @@ cargo install --locked stellar-cli
 git clone https://github.com/Godgift-care/sci-healthcare-contracts
 cd sci-healthcare-contracts
 
-cargo test                                    # 69 tests
+cargo test                                    # 99 tests
 cargo build --target wasm32v1-none --release
+./scripts/build-wasm.sh                       # the release build: optimised wasm + SHA256SUMS
 ```
+
+`scripts/build-wasm.sh` is the build the release workflow and the deployment
+use, so the wasm you build is the wasm that is released and deployed. See
+[Contract reference](contracts.md#building-releasing-and-verifying-the-contracts)
+for the rules it follows.
 
 Create and fund identities, then deploy:
 

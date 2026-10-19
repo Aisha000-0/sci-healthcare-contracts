@@ -6,10 +6,13 @@
   <a href="https://github.com/Godgift-care/sci-healthcare-contracts/actions/workflows/ci.yml">
     <img src="https://github.com/Godgift-care/sci-healthcare-contracts/actions/workflows/ci.yml/badge.svg" alt="CI" />
   </a>
+  <a href="https://github.com/Godgift-care/sci-healthcare-contracts/actions/workflows/ci.yml?query=job%3Acoverage">
+    <img src="https://github.com/Godgift-care/sci-healthcare-contracts/actions/workflows/ci.yml/badge.svg?job=coverage" alt="coverage" />
+  </a>
   <img src="https://img.shields.io/badge/soroban--sdk-27.0.6-blue" alt="soroban-sdk 27.0.6" />
   <img src="https://img.shields.io/badge/rust-1.96-orange" alt="rust 1.96" />
   <img src="https://img.shields.io/badge/license-Apache--2.0-green" alt="Apache 2.0" />
-  <img src="https://img.shields.io/badge/tests-94%20passing-brightgreen" alt="94 tests" />
+  <img src="https://img.shields.io/badge/tests-99%20passing-brightgreen" alt="99 tests" />
 </p>
 
 # SCI Healthcare — Contracts | [Documentation](https://godgift-care.github.io/sci-healthcare-contracts/)
@@ -61,6 +64,32 @@ Clinics and attesters must be verified by the registry admin, so those roles are
 | Test USDC (SAC) | [`CCRLJ7FEIKTR3GBT3VQQPSIJGRBO2WPNMVFKJDP6AYGJQWECOR4QVE5M`](https://stellar.expert/explorer/testnet/contract/CCRLJ7FEIKTR3GBT3VQQPSIJGRBO2WPNMVFKJDP6AYGJQWECOR4QVE5M) |
 | Test USDC faucet (testnet only) | [`CCB25WG7DQ2CSNXPTOHZO2PDZ324FQPZLH3LSNCCLWYM3FEH52GEXC47`](https://stellar.expert/explorer/testnet/contract/CCB25WG7DQ2CSNXPTOHZO2PDZ324FQPZLH3LSNCCLWYM3FEH52GEXC47) |
 
+### Are those contracts really this source?
+
+Every release attaches the exact wasm that was built, with a `SHA256SUMS` file, and `./scripts/verify-deployments.sh` checks the contracts on chain against a local build:
+
+```bash
+./scripts/verify-deployments.sh testnet
+```
+
+It fetches each deployed wasm with `stellar contract fetch` and compares it with the build in two ways: the SHA-256 of the whole file, and the contract interface (functions, errors and events) as the Stellar host reads it.
+
+**Result on testnet, checked on 2026-10-19 against `main`:**
+
+| Contract | Same bytes | Same interface |
+| --- | --- | --- |
+| Registry | no | yes |
+| Voucher escrow | no | **no** |
+| Care receipts | no | yes |
+| Test USDC faucet | no | yes |
+
+Two separate things are going on, and only one of them is a problem:
+
+- **The bytes differ everywhere, and that is expected.** The contracts on testnet were deployed from an older commit, built on a Windows machine with an unpinned pipeline. The Soroban SDK embeds the absolute path of its own source in its panic messages, so those artefacts carry that machine's paths and a different internal layout. [`scripts/build-wasm.sh`](scripts/build-wasm.sh) now pins the toolchain, takes the local path out of the artefact and optimises with the same `wasm-opt` the release uses, so a build made with it is byte-identical for every builder that uses the same toolchain and the same platform. The contracts on testnet predate that.
+- **The voucher is genuinely older than this repository.** Its lifecycle events do not carry `service_code` and `amount` yet; that change is in the source but was never deployed. Redeploying the voucher with `scripts/deploy.sh` makes it match.
+
+The full recipe, and what "byte-identical" does and does not cover, is in [docs/developers/contracts.md](docs/developers/contracts.md).
+
 ## Architecture
 
 Three contracts, one responsibility each.
@@ -110,14 +139,27 @@ rustup target add wasm32v1-none
 cargo install --locked stellar-cli
 ```
 
+`wasm-opt` (binaryen) is needed for the release build and for deploying; the
+pinned release is [binaryen 133](https://github.com/WebAssembly/binaryen/releases/tag/version_133):
+
+```bash
+cargo install --locked wasm-opt   # or download the binaryen release above
+```
+
 ### Build and test
 
 ```bash
 git clone https://github.com/Godgift-care/sci-healthcare-contracts
 cd sci-healthcare-contracts
-cargo test                                    # 94 tests
+cargo test                                    # 99 tests
 cargo build --target wasm32v1-none --release  # three .wasm artifacts
+./scripts/build-wasm.sh                       # the release build: optimised wasm + SHA256SUMS
 ```
+
+`scripts/build-wasm.sh` is the build the release workflow and the deployment
+use, so the wasm you build is the wasm that is released and deployed. See
+[docs/developers/contracts.md](docs/developers/contracts.md) for the rules it
+follows.
 
 ### Deploy to testnet
 
@@ -130,6 +172,34 @@ stellar keys generate --network testnet --fund sci-issuer
 ```
 
 `deploy.sh` writes every address to `deployments/testnet.env` and prints a copy-pasteable block for the app's environment.
+
+## What CI checks
+
+| Check | What it catches |
+| --- | --- |
+| `cargo fmt --all -- --check` | formatting drift |
+| `cargo clippy --all-targets --all-features -- -D warnings` | lint warnings |
+| `cargo test --all` | broken behaviour (99 tests) |
+| `cargo llvm-cov` | contract lines the tests never reach |
+| `cargo deny check` | dependencies with a known advisory or an incompatible licence |
+| `./scripts/build-wasm.sh` | a contract that no longer compiles to wasm |
+
+**Coverage.** The `coverage` job prints the coverage table in the job output
+and fails when the contract sources drop below the threshold. Today the
+contracts are at **98.14% of lines** and **95.99% of regions**; the thresholds
+in CI sit just under those numbers, at 98% and 95%. Test files are excluded:
+the number that matters is how much of the contract code the tests reach.
+Raise the threshold in the same pull request that adds the tests.
+
+**Dependencies.** `cargo deny check` runs the RustSec advisory database, the
+licence allow list, the duplicate and wildcard bans and the source allow list.
+The policy lives in [`deny.toml`](deny.toml); there are no exceptions in it
+today, and any future one has to carry a reason.
+
+**Releases.** Pushing a `v*` tag builds the contracts, optimises them with
+`wasm-opt -Oz` and attaches them to the GitHub release together with a
+`SHA256SUMS` file and notes that explain how to compare the hash with a
+deployed contract.
 
 ## Contract reference
 

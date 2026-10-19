@@ -2,7 +2,17 @@
 
 ## Unreleased
 
+### Added
+- **ci:** a `coverage` job runs `cargo llvm-cov`, prints the coverage table in the job output and fails when the contract sources drop below **98% of lines** or **95% of regions** (today: 98.14% and 95.99%). Test files are excluded from the measurement, so the number says how much of the *contract* code the tests reach. The `lcov` report is uploaded as an artefact, and the README links the job.
+- **ci:** a `dependency audit` job runs `cargo deny check` — RustSec advisories, the licence allow list, the duplicate and wildcard bans and the source allow list — against a new `deny.toml`. It carries no exceptions today; any future one has to carry a reason.
+- **ci:** a `release` workflow builds the contracts when a `v*` tag is pushed, optimises them with `wasm-opt -Oz` (binaryen 133) and attaches them to the GitHub release with a `SHA256SUMS` file and release notes that explain how to compare the hash with a deployed contract.
+- **scripts:** `build-wasm.sh` builds every contract the one way the release, the deployment and the verification agree on, and writes `SHA256SUMS` next to them. `verify-deployments.sh` fetches each deployed contract with `stellar contract fetch` and compares it with a local build twice: by SHA-256, and by contract interface (functions, errors, events) as the Stellar host reads it. It exits non-zero when either differs.
+- **docs:** the README publishes the verification result for testnet and explains it. Three of the four deployed contracts expose exactly the interface this source builds; the voucher does not, because its lifecycle events gained `service_code` and `amount` after it was deployed. Redeploying fixes it.
+
 ### Changed
+- **deploy:** `scripts/deploy.sh` and `scripts/deploy-faucet.sh` deploy the wasm that `scripts/build-wasm.sh` produces, so what is deployed is what is released. The faucet used to be built on its own (`cargo build -p sci-faucet`), which links a different `soroban-sdk` than the rest of the workspace and produces different bytes.
+- **build:** the build takes the cargo registry path out of the wasm (`--remap-path-prefix`). The Soroban SDK embeds the absolute path of its own source in its panic messages, so the artefact used to carry the builder's home directory, and two machines never agreed on its hash.
+- **cargo:** the workspace path dependencies carry a version, so `cargo deny` does not read them as wildcard version requirements.
 - **voucher:** `voucher_claimed`, `voucher_attested`, `voucher_disputed`, `voucher_settled` and `voucher_refunded` now carry `service_code` and `amount` in their data, appended after the fields each event already had. Only `voucher_created` used to say what the voucher was for, so an indexer or wallet reading a single lifecycle event had to load the voucher to show what was paid for. `voucher_refunded` already carried `amount`; it gains `service_code` only. Topics are unchanged and the data map is keyed by name, so the indexer in `sci-healthcare-backend` decodes the new layout without a breaking change (its matching decoder change is linked from the pull request). Covered by five event snapshot tests in `contracts/voucher/src/test.rs` that read the decoded XDR event and the regenerated `test_snapshots`.
 
 ## 0.2.0 — 2026-10-09
