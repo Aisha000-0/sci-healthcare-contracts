@@ -14,5 +14,5 @@ soroban-sdk = { workspace = true, features = ["alloc"] }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
-sci-registry = { path = "../registry" }
-sci-receipt = { path = "../receipt" }
+sci-registry = { workspace = true }
+sci-receipt = { workspace = true }

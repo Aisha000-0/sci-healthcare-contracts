@@ -7,6 +7,9 @@
 #
 # Run after deploy.sh and seed.sh: once the faucet is the token admin, the
 # issuer can no longer mint directly. To undo, call release_token_admin.
+#
+# Requires: stellar CLI >= 27, wasm-opt (binaryen 133), a funded source
+# identity named $ADMIN.
 
 set -euo pipefail
 
@@ -30,12 +33,16 @@ set -a; source "$ENV_FILE"; set +a
 say() { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 ADMIN_ADDR="$(stellar keys address "$ADMIN")"
 
-say "Building faucet"
-(cd "$ROOT" && cargo build --target wasm32v1-none --release -p sci-faucet)
+say "Building contracts"
+# The whole workspace is built, not just the faucet: cargo unifies features
+# per package, so building one contract on its own produces different bytes.
+# scripts/build-wasm.sh is the same build the release workflow performs.
+"$ROOT/scripts/build-wasm.sh" "$ROOT/dist" >/dev/null
+grep sci_faucet "$ROOT/dist/SHA256SUMS"
 
 say "Deploying faucet"
 FAUCET_ID="$(stellar contract deploy \
-  --wasm "$ROOT/target/wasm32v1-none/release/sci_faucet.wasm" \
+  --wasm "$ROOT/dist/sci_faucet.wasm" \
   --source-account "$ADMIN" --network "$NETWORK")"
 echo "  faucet: $FAUCET_ID"
 

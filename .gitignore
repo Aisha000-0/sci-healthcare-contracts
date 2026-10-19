@@ -1,5 +1,7 @@
 target/
+dist/
 *.wasm
+lcov.info
 .env
 .stellar/
 .DS_Store

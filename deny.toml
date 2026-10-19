@@ -1,0 +1,92 @@
+# cargo-deny configuration.
+#
+# Run locally with:
+#   cargo install --locked cargo-deny --version 0.20.2
+#   cargo deny check
+#
+# CI runs the same checks (see .github/workflows/ci.yml, job "deny").
+#
+# This is a supply-chain gate for a contracts repo: the contracts themselves
+# hold escrowed money, so a compromised or unmaintained dependency is a
+# wallet-sized problem, not a convenience bug.
+
+[graph]
+# The contracts ship as wasm32v1-none, but the test suites also run on the
+# host, so both targets are checked.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "wasm32v1-none",
+]
+all-features = true
+
+[advisories]
+version = 2
+# Nothing is ignored today. Any future exception must be listed here with a
+# `reason` string, and the reason is reviewed like any other code.
+ignore = []
+# Only report crates that are unmaintained when they are workspace members.
+# The transitive graph carries unmaintained helper crates pulled in by the
+# Soroban SDK, and flagging all of them buries the signal.
+unmaintained = "workspace"
+
+[licenses]
+version = 2
+# Permissive, widely-used licences only. The contracts are Apache-2.0.
+#
+# - Apache-2.0 / Apache-2.0 WITH LLVM-exception: Soroban SDK and most of
+#   the Rust ecosystem.
+# - MIT / BSD-2-Clause / BSD-3-Clause / BSD-1-Clause: common in crypto
+#   primitives (curve25519-dalek, ed25519-dalek, fiat-crypto, zerocopy).
+# - Unicode-3.0: unicode-ident.
+# - Unlicense / Zlib: memchr, byteorder, visibility, cfg_eval.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+# No per-crate licence exceptions today.
+exceptions = []
+# A licence that no crate in the graph uses exactly (fiat-crypto, for
+# example, is "MIT OR Apache-2.0 OR BSD-1-Clause" and so is only ever counted
+# under one of them) is not a problem, so the "unused allowance" note is off.
+unused-allowed-license = "allow"
+
+[licenses.private]
+# Workspace crates are not published to crates.io; they are Apache-2.0 and
+# checked from the workspace manifest.
+ignore = true
+
+[bans]
+# Duplicate versions exist in the Soroban SDK's dependency graph and cannot be
+# removed from here, so duplicates are a warning, not a failure. Everything
+# else in this section is denied.
+multiple-versions = "warn"
+highlight = "all"
+# No wildcard version requirements are allowed anywhere in the graph. The
+# workspace path dependencies carry a version for exactly this reason.
+wildcards = "deny"
+# No crate is allow-listed or banned outright today.
+allow = []
+deny = []
+# Nothing is skipped, so no crate is hidden from the duplicate check.
+skip = []
+
+[sources]
+# Dependencies may only come from crates.io. A git dependency is a supply-chain
+# hole, so it is denied rather than warned about.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []
