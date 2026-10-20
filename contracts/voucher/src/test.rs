@@ -2203,3 +2203,108 @@ fn admin_changed_event_snapshot() {
     assert_layout(&e, "admin_changed", &[], &["new_admin"]);
     assert_eq!(field_address(&f.env, &e, "new_admin"), nominee);
 }
+
+#[test]
+fn not_initialized_errors() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let a = Address::generate(&env);
+    let addr = env.register(VoucherEscrow, ());
+    let client = VoucherEscrowClient::new(&env, &addr);
+
+    // Calls that read the config before initialize should return NotInitialized.
+    let err = client.try_get_config().err().unwrap().unwrap();
+    assert_eq!(err, VoucherError::NotInitialized);
+    // get_voucher returns VoucherNotFound because the voucher doesn't exist,
+    // not because the contract isn't initialized.
+    let err = client.try_get_voucher(&1u64).err().unwrap().unwrap();
+    assert_eq!(err, VoucherError::VoucherNotFound);
+    // create_voucher requires config, so it returns NotInitialized.
+    let err = client
+        .try_create_voucher(
+            &a,
+            &BytesN::from_array(&env, &[1u8; 32]),
+            &a,
+            &1u32,
+            &100i128,
+            &(env.ledger().timestamp() + 1000),
+        )
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VoucherError::NotInitialized);
+}
+
+#[test]
+fn math_overflow_in_fee_calculation() {
+    // If fee_bps and amount are both large, multiplication can overflow.
+    // This is exercised by the internal fee_for function. We test the
+    // internal path by using a large amount and fee_bps.
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = START_TIME);
+
+    let admin = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let attester = Address::generate(&env);
+    let fee_account = Address::generate(&env);
+
+    let issuer = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(issuer);
+    let token_addr = sac.address();
+    let _token_client = token::Client::new(&env, &token_addr);
+    let token_admin = token::StellarAssetClient::new(&env, &token_addr);
+    token_admin.mint(&funder, &i128::MAX);
+
+    let registry_addr = env.register(Registry, ());
+    let registry = RegistryClient::new(&env, &registry_addr);
+    registry.initialize(&admin);
+    registry.register_provider(
+        &provider,
+        &String::from_str(&env, "Clinic"),
+        &String::from_str(&env, "NG"),
+    );
+    registry.set_provider_status(&admin, &provider, &ProviderStatus::Active);
+    registry.upsert_service(
+        &provider,
+        &CONSULT,
+        &String::from_str(&env, "Consult"),
+        &CONSULT_PRICE,
+    );
+    registry.add_attester(&admin, &attester);
+
+    let voucher_addr = env.register(VoucherEscrow, ());
+    let voucher = VoucherEscrowClient::new(&env, &voucher_addr);
+
+    let receipt_addr = env.register(ReceiptBook, ());
+    let receipts = ReceiptBookClient::new(&env, &receipt_addr);
+    receipts.initialize(&admin, &voucher_addr);
+    // Use a fee_bps that makes the multiplication overflow i128.
+    // fee_bps = MAX_FEE_BPS = 1000 (10%), amount = i128::MAX
+    // i128::MAX * 1000 > i128::MAX
+    voucher.initialize(
+        &admin,
+        &registry_addr,
+        &receipt_addr,
+        &token_addr,
+        &DISPUTE_WINDOW,
+        &1_000u32,
+        &fee_account,
+    );
+
+    let id = voucher.create_voucher(
+        &funder,
+        &patient(&env),
+        &provider,
+        &CONSULT,
+        &i128::MAX,
+        &(START_TIME + 30 * 24 * 60 * 60),
+    );
+    // settle() calls fee_for internally which can overflow
+    voucher.claim(&provider, &id);
+    voucher.attest(&attester, &id);
+    advance(&env, DISPUTE_WINDOW + 1);
+    let err = voucher.try_settle(&id).err().unwrap().unwrap();
+    assert_eq!(err, VoucherError::MathOverflow);
+}
