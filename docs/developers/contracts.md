@@ -9,6 +9,8 @@ Three contracts. `registry` and `receipt` hold no references and deploy first; `
 
 All amounts are `i128` in the token's smallest unit. All timestamps are `u64` seconds since epoch.
 
+Protocol terminology used across the docs is defined in [docs/glossary.md](../glossary.md). Clinic questions (payment timing, disputes, fees) are answered in [docs/guides/clinics-faq.md](../guides/clinics-faq.md), and French versions of the funder, clinic and attester guides live under [docs/fr/](../fr/).
+
 ---
 
 ## registry

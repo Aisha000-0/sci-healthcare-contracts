@@ -5,6 +5,8 @@ nav_order: 8
 
 # Attesting delivery
 
+🇫🇷 [Lire ce guide en français](../fr/attesters.md)
+
 An attester confirms that care actually happened. This is the most important role in the protocol and the one carrying the most responsibility.
 
 ## What you are doing

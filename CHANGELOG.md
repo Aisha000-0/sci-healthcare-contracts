@@ -16,6 +16,10 @@
 - **ci:** a `release` workflow builds the contracts when a `v*` tag is pushed, optimises them with `wasm-opt -Oz` (binaryen 133) and attaches them to the GitHub release with a `SHA256SUMS` file and release notes that explain how to compare the hash with a deployed contract.
 - **scripts:** `build-wasm.sh` builds every contract the one way the release, the deployment and the verification agree on, and writes `SHA256SUMS` next to them. `verify-deployments.sh` fetches each deployed contract with `stellar contract fetch` and compares it with a local build twice: by SHA-256, and by contract interface (functions, errors, events) as the Stellar host reads it. It exits non-zero when either differs.
 - **docs:** the README publishes the verification result for testnet and explains it. Three of the four deployed contracts expose exactly the interface this source builds; the voucher does not, because its lifecycle events gained `service_code` and `amount` after it was deployed. Redeploying fixes it.
+- **docs:** a [glossary of protocol terms](docs/glossary.md) with short definitions and links to where each term is used (attester, claim grace, dispute window, beneficiary reference, basis points and more), linked from [the docs index](docs/SUMMARY.md).
+- **docs:** a [clinic FAQ](docs/guides/clinics-faq.md) with thirteen questions covering when clinics are paid, what happens when a patient never comes, how disputes work and what fees apply, each answered with links to the source and checked against the contract constants.
+- **docs:** French translations of the funder, clinic and attester guides under [docs/fr/](docs/fr/), with language-switch links at the top of each guide.
+- **chore:** [Dependabot configuration](.github/dependabot.yml) for Cargo and GitHub Actions, with weekly updates grouped so soroban-sdk upgrades are labelled for careful review.
 
 ### Changed
 - **receipt:** `count_for` now extends the TTL of the count entry it reads. It was the only persistent read in the three contracts that did not, so a patient's episode count could be archived while their receipts stayed live. Covered by `count_for_extends_its_own_entry`.
