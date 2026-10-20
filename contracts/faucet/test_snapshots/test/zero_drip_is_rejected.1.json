@@ -170,6 +170,22 @@
                           },
                           {
                             "key": {
+                              "symbol": "daily_cap"
+                            },
+                            "val": {
+                              "i128": "1000000000"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "paused"
+                            },
+                            "val": {
+                              "bool": false
+                            }
+                          },
+                          {
+                            "key": {
                               "symbol": "token"
                             },
                             "val": {

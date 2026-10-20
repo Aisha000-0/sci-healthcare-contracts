@@ -26,6 +26,8 @@ const INSTANCE_TTL_EXTEND: u32 = 30 * DAY_IN_LEDGERS;
 /// Drip records only need to outlive the longest sensible cooldown.
 const DRIP_TTL_THRESHOLD: u32 = DAY_IN_LEDGERS;
 const DRIP_TTL_EXTEND: u32 = 7 * DAY_IN_LEDGERS;
+/// Seconds in a UTC day: buckets the shared daily-cap counter.
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -37,6 +39,12 @@ pub struct FaucetConfig {
     pub amount: i128,
     /// Seconds an address must wait between drips.
     pub cooldown: u64,
+    /// Base units the faucet may mint per UTC day, across all addresses
+    /// combined. Resets when the day changes.
+    pub daily_cap: i128,
+    /// While true, `drip` is rejected for everyone. Toggled with
+    /// `set_paused`; pausing does not give up the token admin role.
+    pub paused: bool,
 }
 
 #[contracttype]
@@ -45,6 +53,9 @@ pub enum DataKey {
     Config,
     /// Ledger time of an address's last drip.
     LastDrip(Address),
+    /// (`day`, `minted`) running total for the current UTC day, shared by
+    /// every address. Reset when the day changes.
+    DailyCap,
 }
 
 #[contracterror]
@@ -56,6 +67,10 @@ pub enum FaucetError {
     NotAuthorized = 3,
     InvalidAmount = 4,
     CoolingDown = 5,
+    /// The daily minting cap across all addresses has been reached.
+    DailyCapReached = 6,
+    /// The faucet is paused; `drip` is rejected until the admin unpauses.
+    Paused = 7,
 }
 
 #[contractevent]
@@ -66,23 +81,35 @@ pub struct Dripped {
     pub amount: i128,
 }
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DripChanged {
+    pub amount: i128,
+    pub cooldown: u64,
+}
+
 #[contract]
 pub struct Faucet;
 
 #[contractimpl]
 impl Faucet {
-    /// Sets the admin, token, drip amount and cooldown. Callable once.
+    /// Sets the admin, token, drip amount, cooldown and daily cap. Callable once.
+    ///
+    /// `daily_cap` is the maximum number of base units the faucet may mint per
+    /// UTC day across all addresses combined. The per-address cooldown still
+    /// applies on top of it.
     pub fn initialize(
         env: Env,
         admin: Address,
         token: Address,
         amount: i128,
         cooldown: u64,
+        daily_cap: i128,
     ) -> Result<(), FaucetError> {
         if env.storage().instance().has(&DataKey::Config) {
             return Err(FaucetError::AlreadyInitialized);
         }
-        if amount <= 0 {
+        if amount <= 0 || daily_cap <= 0 {
             return Err(FaucetError::InvalidAmount);
         }
         Self::write_config(
@@ -92,26 +119,44 @@ impl Faucet {
                 token,
                 amount,
                 cooldown,
+                daily_cap,
+                paused: false,
             },
         );
         Ok(())
     }
 
-    /// Mints the drip amount to `to`, at most once per cooldown.
+    /// Mints the drip amount to `to`, at most once per cooldown, and only
+    /// while the shared daily cap has not been reached.
     ///
     /// `to` must sign, so one wallet cannot drain the faucet on behalf of
     /// many addresses it does not control. A classic account also needs a
     /// trustline for the token, as for any Stellar asset.
     pub fn drip(env: Env, to: Address) -> Result<i128, FaucetError> {
-        to.require_auth();
         let config = Self::read_config(&env)?;
+        if config.paused {
+            return Err(FaucetError::Paused);
+        }
+        to.require_auth();
 
         let now = env.ledger().timestamp();
+
         let key = DataKey::LastDrip(to.clone());
         if let Some(last) = env.storage().temporary().get::<_, u64>(&key) {
             if now < last.saturating_add(config.cooldown) {
                 return Err(FaucetError::CoolingDown);
             }
+        }
+
+        // Daily cap is shared by every address and resets at day boundaries.
+        let day = now / SECONDS_PER_DAY;
+        let cap_key = DataKey::DailyCap;
+        let mut state: (u64, i128) = env.storage().instance().get(&cap_key).unwrap_or((0, 0));
+        if state.0 != day {
+            state = (day, 0);
+        }
+        if state.1.saturating_add(config.amount) > config.daily_cap {
+            return Err(FaucetError::DailyCapReached);
         }
 
         token::StellarAssetClient::new(&env, &config.token).mint(&to, &config.amount);
@@ -120,6 +165,8 @@ impl Faucet {
         env.storage()
             .temporary()
             .extend_ttl(&key, DRIP_TTL_THRESHOLD, DRIP_TTL_EXTEND);
+        state.1 = state.1.saturating_add(config.amount);
+        env.storage().instance().set(&cap_key, &state);
         Self::extend_instance(&env);
 
         Dripped {
@@ -143,6 +190,16 @@ impl Faucet {
         }
         config.amount = amount;
         config.cooldown = cooldown;
+        Self::write_config(&env, &config);
+        DripChanged { amount, cooldown }.publish(&env);
+        Ok(())
+    }
+
+    /// Pauses or unpauses the faucet. While paused, `drip` is rejected for
+    /// everyone. Pausing does not give up the token admin role. Admin only.
+    pub fn set_paused(env: Env, admin: Address, paused: bool) -> Result<(), FaucetError> {
+        let mut config = Self::require_admin(&env, &admin)?;
+        config.paused = paused;
         Self::write_config(&env, &config);
         Ok(())
     }

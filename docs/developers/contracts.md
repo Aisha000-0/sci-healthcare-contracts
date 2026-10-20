@@ -269,10 +269,15 @@ pub struct Receipt {
 | `mint` | `minter, voucher_id, beneficiary_ref, provider, service_code, amount` | `()` | `minter` |
 | `get_receipt` | `voucher_id` | `Receipt` | view |
 | `count_for` | `beneficiary_ref` | `u32` | view |
+| `name` | — | `String` | none (view) |
+| `symbol` | — | `String` | none (view) |
+| `receipt_uri` | `voucher_id` | `String` | none (view) |
 | `get_minter` | — | `Address` | view |
 | `get_admin` | — | `Address` | view |
 
 Only the minter — the voucher contract — may mint. Because the voucher contract does not exist when the receipt book is initialised, deploy order is: receipt, voucher, then `set_minter`.
+
+Receipts are soulbound: there is deliberately no transfer function, so a receipt stays bound to the beneficiary reference it was minted against. `name`, `symbol` and `receipt_uri` are read-only wallet metadata. `receipt_uri(voucher_id)` returns `https://receipts.sci.health/v1/receipt/<voucher_id>` — the voucher id only, no patient or beneficiary data — so explorers can display the receipt without exposing any PHI.
 
 ### Authorisation matrix
 
@@ -288,6 +293,9 @@ Every public function, with the exact signer it demands. `AUTH_MATRIX` in `contr
 | `get_pending_admin` | none (view) |
 | `get_receipt` | none (view) |
 | `count_for` | none (view) |
+| `name` | none (view) |
+| `symbol` | none (view) |
+| `receipt_uri` | none (view) |
 | `get_minter` | none (view) |
 | `get_admin` | none (view) |
 
@@ -313,14 +321,17 @@ Lets anyone trying the demo get test USDC without a server holding the issuer ke
 
 | Function | Parameters | Returns | Auth |
 | --- | --- | --- | --- |
-| `initialize` | `admin, token, amount, cooldown` | `()` | once |
+| `initialize` | `admin, token, amount, cooldown, daily_cap` | `()` | once |
 | `drip` | `to` | `i128` | `to` |
 | `set_drip` | `admin, amount, cooldown` | `()` | `admin` |
+| `set_paused` | `admin, paused` | `()` | `admin` |
 | `release_token_admin` | `admin, new_admin` | `()` | `admin` |
 | `get_config` | — | `FaucetConfig` | view |
 | `next_drip_at` | `to` | `u64` (0 if allowed now) | view |
 
 `drip` requires the recipient's signature, so one wallet cannot drain the faucet into addresses it does not control, and each address may drip once per `cooldown`. A classic account needs a trustline for the token first; the token reports a missing one as its error `#13`.
+
+`initialize` sets a `daily_cap` — the total base units the faucet may mint per UTC day across every address combined. The counter resets at each day boundary, and drips beyond it are rejected with `DailyCapReached`. The admin can pause the faucet with `set_paused(admin, true)` without giving up the token admin role; while paused, every `drip` is rejected with `Paused`.
 
 On testnet the faucet drips 50 USDC once a day: [`CCB25WG7DQ2CSNXPTOHZO2PDZ324FQPZLH3LSNCCLWYM3FEH52GEXC47`](https://stellar.expert/explorer/testnet/contract/CCB25WG7DQ2CSNXPTOHZO2PDZ324FQPZLH3LSNCCLWYM3FEH52GEXC47).
 
@@ -331,6 +342,17 @@ On testnet the faucet drips 50 USDC once a day: [`CCB25WG7DQ2CSNXPTOHZO2PDZ324FQ
 | 3 | `NotAuthorized` |
 | 4 | `InvalidAmount` |
 | 5 | `CoolingDown` |
+| 6 | `DailyCapReached` |
+| 7 | `Paused` |
+
+### Events
+
+| Event | Topics | Data |
+| --- | --- | --- |
+| `dripped` | `to` | `amount` |
+| `drip_changed` | — | `amount`, `cooldown` |
+
+`drip_changed` is published by `set_drip` so configuration changes are auditable. Its data map is keyed by field name; topics are unchanged.
 
 ---
 
