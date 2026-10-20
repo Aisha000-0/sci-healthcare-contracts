@@ -149,21 +149,25 @@ jobs:
           echo "$PWD/binaryen-version_133/bin" >> "$GITHUB_PATH"
       - name: First build
         run: |
+          mkdir -p /tmp/build1
+          cp -r . /tmp/build1/src
           mkdir -p /tmp/cargo-home
-          CARGO_HOME=/tmp/cargo-home ./scripts/build-wasm.sh dist1
-      - name: Clean target directory
-        run: rm -rf target
+          cd /tmp/build1/src && CARGO_HOME=/tmp/cargo-home ./scripts/build-wasm.sh dist1
+          cp -r /tmp/build1/src/dist1 /tmp/build1-dist1
       - name: Second build
         run: |
-          CARGO_HOME=/tmp/cargo-home ./scripts/build-wasm.sh dist2
+          mkdir -p /tmp/build2
+          cp -r . /tmp/build2/src
+          cd /tmp/build2/src && CARGO_HOME=/tmp/cargo-home ./scripts/build-wasm.sh dist2
+          cp -r /tmp/build2/src/dist2 /tmp/build2-dist2
       - name: Compare checksums
         run: |
-          if ! diff dist1/SHA256SUMS dist2/SHA256SUMS; then
+          if ! diff /tmp/build1-dist1/SHA256SUMS /tmp/build2-dist2/SHA256SUMS; then
             echo "::error::Builds are not reproducible - checksums differ"
             echo "First build:"
-            cat dist1/SHA256SUMS
+            cat /tmp/build1-dist1/SHA256SUMS
             echo "Second build:"
-            cat dist2/SHA256SUMS
+            cat /tmp/build2-dist2/SHA256SUMS
             exit 1
           fi
           echo "Builds are reproducible - checksums match"
