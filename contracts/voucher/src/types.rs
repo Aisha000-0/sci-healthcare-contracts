@@ -80,6 +80,24 @@ pub enum DataKey {
     /// Attestations made by an attester on a UTC day (`timestamp / 86400`).
     /// Temporary storage: it only has to outlive the day it counts.
     Attestations(Address, u64),
+    /// What a clinic currently has in escrow: see `Exposure`.
+    Exposure(Address),
+    /// Most value one clinic may hold in escrow at once. Unset or 0 means
+    /// unlimited.
+    EscrowCap,
+}
+
+/// A clinic's open vouchers: every voucher funded to it that has not yet
+/// been settled or refunded, counted and summed.
+///
+/// Raised by `create_voucher` and lowered when a voucher settles or refunds,
+/// so it backs both the clinic's declared capacity and the protocol's
+/// per-clinic escrow cap.
+#[contracttype]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Exposure {
+    pub vouchers: u32,
+    pub value: i128,
 }
 
 #[contracterror]
@@ -111,6 +129,14 @@ pub enum VoucherError {
     AttestationCapReached = 19,
     /// The attestation cap must be at least 1.
     InvalidAttestationCap = 20,
+    /// The clinic already has as many vouchers outstanding as the capacity it
+    /// declared in the registry.
+    ProviderAtCapacity = 21,
+    /// Funding this voucher would take the clinic's escrow above the
+    /// per-clinic cap.
+    EscrowCapReached = 22,
+    /// The per-clinic escrow cap cannot be negative.
+    InvalidEscrowCap = 23,
 }
 
 /// Maps the shared helpers' failures onto this contract's error numbers, so

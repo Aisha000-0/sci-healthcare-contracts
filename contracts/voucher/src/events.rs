@@ -114,6 +114,16 @@ pub struct AttestationCapChanged {
     pub cap: u32,
 }
 
+/// The admin changed the most value one clinic may hold in escrow. `max` is
+/// 0 for unlimited.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowCapChanged {
+    #[topic]
+    pub admin: Address,
+    pub max: i128,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminProposed {

@@ -91,6 +91,24 @@ pub(crate) fn read_attester(env: &Env, addr: &Address) -> bool {
     }
 }
 
+/// A clinic's declared voucher capacity; 0 (unlimited) when never set.
+pub(crate) fn read_capacity(env: &Env, addr: &Address) -> u32 {
+    let key = DataKey::Capacity(addr.clone());
+    match env.storage().persistent().get(&key) {
+        Some(capacity) => {
+            common::extend_persistent(env, &key);
+            capacity
+        }
+        None => 0,
+    }
+}
+
+pub(crate) fn write_capacity(env: &Env, addr: &Address, capacity: u32) {
+    let key = DataKey::Capacity(addr.clone());
+    env.storage().persistent().set(&key, &capacity);
+    common::extend_persistent(env, &key);
+}
+
 pub(crate) fn write_attester(env: &Env, addr: &Address, enabled: bool) {
     let key = DataKey::Attester(addr.clone());
     env.storage().persistent().set(&key, &enabled);

@@ -835,6 +835,10 @@ const AUTH_MATRIX: &[AuthCase] = &[
         auth: signer("`provider_addr`", provider_addr),
     },
     AuthCase {
+        function: "set_capacity",
+        auth: signer("`provider_addr`", provider_addr),
+    },
+    AuthCase {
         function: "add_attester",
         auth: signer("`admin`", admin_addr),
     },
@@ -888,6 +892,10 @@ const AUTH_MATRIX: &[AuthCase] = &[
     },
     AuthCase {
         function: "is_attester",
+        auth: Auth::Free("none (view)"),
+    },
+    AuthCase {
+        function: "get_capacity",
         auth: Auth::Free("none (view)"),
     },
     AuthCase {
@@ -953,6 +961,13 @@ fn run_case(f: &AuthFixture, function: &str) -> std::vec::Vec<Address> {
             activate(&f.f, &f.provider);
             upsert();
             client.set_service_available(&f.provider, &CONSULT, &false);
+        }
+        "set_capacity" => {
+            activate(&f.f, &f.provider);
+            client.set_capacity(&f.provider, &5);
+        }
+        "get_capacity" => {
+            client.get_capacity(&f.provider);
         }
         "add_attester" => {
             client.add_attester(&f.f.admin, &f.new_provider);
@@ -1559,4 +1574,54 @@ fn registry_reads_restore_a_lapsed_entry() {
 
     // And it is still billable: a voucher for this provider can be funded.
     assert!(f.client.is_active_provider(&provider));
+}
+
+// ----- clinic capacity -----
+
+#[test]
+fn capacity_defaults_to_unlimited() {
+    let f = setup();
+    let provider = register_active_provider(&f);
+    assert_eq!(f.client.get_capacity(&provider), 0);
+    // An address that never registered reads as unlimited too.
+    assert_eq!(f.client.get_capacity(&Address::generate(&f.env)), 0);
+}
+
+#[test]
+fn provider_sets_and_clears_capacity() {
+    let f = setup();
+    let provider = register_active_provider(&f);
+
+    f.client.set_capacity(&provider, &3);
+    assert_eq!(f.client.get_capacity(&provider), 3);
+
+    f.client.set_capacity(&provider, &0);
+    assert_eq!(f.client.get_capacity(&provider), 0);
+}
+
+#[test]
+fn capacity_needs_a_registered_provider() {
+    let f = setup();
+    let stranger = Address::generate(&f.env);
+    assert_eq!(
+        f.client.try_set_capacity(&stranger, &3),
+        Err(Ok(RegistryError::ProviderNotFound))
+    );
+}
+
+#[test]
+fn capacity_changed_event_snapshot() {
+    let f = setup();
+    let provider = register_active_provider(&f);
+
+    f.client.set_capacity(&provider, &12);
+
+    let e = one_event(&f);
+    assert_layout(
+        &e,
+        "capacity_changed",
+        &[ScVal::from(&provider)],
+        &["max_outstanding"],
+    );
+    assert_eq!(field_u32(&e, "max_outstanding"), 12);
 }

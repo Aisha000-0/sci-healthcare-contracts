@@ -54,6 +54,7 @@ pub struct ServiceItem {
 | `schedule_service_price` | `provider_addr, code, price, effective_at` | `()` | `provider_addr` | `InvalidPrice`, `ProviderNotActive`, `ServiceNotFound`, `PriceNoticeTooShort` |
 | `remove_service` | `provider_addr, code` | `()` | `provider_addr` | `ServiceNotFound` |
 | `set_service_available` | `provider_addr, code, available: bool` | `()` | `provider_addr` | `ServiceNotFound` |
+| `set_capacity` | `provider_addr, max_outstanding: u32` | `()` | `provider_addr` | `ProviderNotFound` |
 | `add_attester` | `admin, attester` | `()` | `admin` | `NotAuthorized` |
 | `remove_attester` | `admin, attester` | `()` | `admin` | `NotAuthorized` |
 | `propose_admin` | `admin, new_admin` | `()` | `admin` | `NotAuthorized` |
@@ -67,6 +68,7 @@ pub struct ServiceItem {
 | `get_upcoming_price` | `provider_addr, code` | `(i128, u64)` | view | `ServiceNotFound` |
 | `is_service_available` | `provider_addr, code` | `bool` | view | — |
 | `is_attester` | `addr` | `bool` | view | — |
+| `get_capacity` | `provider_addr` | `u32` | view | — |
 | `get_admin` | — | `Address` | view | `NotInitialized` |
 | `version` | — | `String` | view | — |
 
@@ -75,6 +77,8 @@ pub struct ServiceItem {
 A clinic that temporarily cannot deliver a service (out of test kits, say) calls `set_service_available(provider_addr, code, false)` instead of delisting it. The service keeps its catalogue entry and its price, `is_service_available` returns `false`, and `voucher` refuses to fund it with `ServiceUnavailable`. Vouchers already funded against it are unaffected. `upsert_service` keeps a paused service paused; only `set_service_available(…, true)` puts it back on sale. New services are listed as available.
 
 Price changes are scheduled, not sprung. `schedule_service_price(provider_addr, code, price, effective_at)` records a new price that takes effect at `effective_at`, which must be at least `MIN_PRICE_NOTICE_SECS` (24 hours) away or the call fails with `PriceNoticeTooShort`. Until then `get_service_price` returns the current price and `get_upcoming_price` returns `(price, effective_at)` so apps can warn funders; from `effective_at` on, every read returns the new price — no keeper has to call in. Scheduling again replaces the earlier schedule, and scheduling the current price calls a change off. `upsert_service` still lists a new service, or lowers an existing price, at once, but rejects a rise with `PriceIncreaseNeedsNotice`. A service that is removed and listed again starts fresh, at whatever price it is listed with.
+
+A clinic declares how many vouchers it can serve at once with `set_capacity(provider_addr, max_outstanding)`; `0` — the default — means unlimited. `voucher` counts each clinic's outstanding vouchers (funded, claimed, attested or disputed) and refuses a new one at capacity with `ProviderAtCapacity`; the count drops when a voucher settles or refunds. Lowering the capacity never affects vouchers already funded. The change emits `capacity_changed` (topic `provider`; data `max_outstanding`).
 
 Every contract — registry, voucher, receipt and faucet — has a `version()` view returning the crate version it was built from (`CARGO_PKG_VERSION`, the workspace version, currently `0.2.0`). Use it to tell which build a deployment runs before relying on a newer function.
 
@@ -91,6 +95,7 @@ Every public function, with the exact signer it demands — no signature that is
 | `schedule_service_price` | `provider_addr` |
 | `remove_service` | `provider_addr` |
 | `set_service_available` | `provider_addr` |
+| `set_capacity` | `provider_addr` |
 | `add_attester` | `admin` |
 | `remove_attester` | `admin` |
 | `propose_admin` | `admin` |
@@ -105,6 +110,7 @@ Every public function, with the exact signer it demands — no signature that is
 | `get_upcoming_price` | none (view) |
 | `is_service_available` | none (view) |
 | `is_attester` | none (view) |
+| `get_capacity` | none (view) |
 | `version` | none (view) |
 
 A signer is not the same as a role: `admin` must be the stored admin **and** sign, and the two checks are ordered so a wrong `admin` argument fails before any signature is requested.
@@ -129,7 +135,7 @@ A signer is not the same as a role: `admin` must be the stored admin **and** sig
 
 ### Events
 
-`provider_registered`, `provider_status_changed`, `service_upserted`, `service_removed`, `service_price_scheduled` (topics `provider`, `code`; data `price`, `effective_at`), `service_availability_changed` (topics `provider`, `code`; data `available`), `attester_added`, `attester_removed`, `admin_changed`, `initialized`
+`provider_registered`, `provider_status_changed`, `service_upserted`, `service_removed`, `service_price_scheduled` (topics `provider`, `code`; data `price`, `effective_at`), `service_availability_changed` (topics `provider`, `code`; data `available`), `capacity_changed` (topic `provider`; data `max_outstanding`), `attester_added`, `attester_removed`, `admin_changed`, `initialized`
 
 ---
 
@@ -159,6 +165,11 @@ pub struct Voucher {
     pub attested_at: u64,
     pub dispute_deadline: u64,
 }
+
+pub struct Exposure {            // a clinic's open vouchers
+    pub vouchers: u32,           // funded and not yet settled or refunded
+    pub value: i128,             // what they escrow in total
+}
 ```
 
 ### Functions
@@ -174,10 +185,13 @@ pub struct Voucher {
 | `refund` | `voucher_id` | `()` | **none** |
 | `resolve_dispute` | `admin, voucher_id, refund_funder: bool` | `()` | `admin` |
 | `set_attestation_cap` | `admin, cap: u32` | `()` | `admin` |
+| `set_max_escrow_per_provider` | `admin, max: i128` | `()` | `admin` |
 | `propose_admin` | `admin, new_admin` | `()` | `admin` |
 | `accept_admin` | `new_admin` | `()` | `new_admin` |
 | `get_voucher` | `voucher_id` | `Voucher` | view |
 | `refundable_at` | `voucher_id` | `u64` | view |
+| `get_max_escrow_per_provider` | — | `i128` | view |
+| `get_exposure` | `provider` | `Exposure` | view |
 | `get_attestation_cap` | — | `u32` | view |
 | `attestations_left` | `attester` | `u32` | view |
 | `get_pending_admin` | — | `Option<Address>` | view |
@@ -205,8 +219,11 @@ Every public function, with the exact signer it demands. `AUTH_MATRIX` in `contr
 | `refund` | none (permissionless) |
 | `resolve_dispute` | `admin` |
 | `set_attestation_cap` | `admin` |
+| `set_max_escrow_per_provider` | `admin` |
 | `propose_admin` | `admin` |
 | `accept_admin` | `new_admin` |
+| `get_max_escrow_per_provider` | none (view) |
+| `get_exposure` | none (view) |
 | `get_attestation_cap` | none (view) |
 | `attestations_left` | none (view) |
 | `get_pending_admin` | none (view) |
@@ -224,7 +241,9 @@ rejects the voucher's own provider even if it holds that role.
 
 ### What each function checks
 
-**`create_voucher`** — amount > 0; expiry in the future; provider is `Active`; the service exists and is active; amount ≥ listed price; the service is not paused (`ServiceUnavailable`). Transfers the token *before* writing the voucher, so a failed transfer reverts everything.
+**`create_voucher`** — amount > 0; expiry in the future; provider is `Active`; the service exists and is active; amount ≥ listed price; the service is not paused (`ServiceUnavailable`); the clinic is below the capacity it declared in the registry (`ProviderAtCapacity`); the clinic's escrow plus this amount stays within the per-clinic cap (`EscrowCapReached`). Transfers the token *before* writing the voucher, so a failed transfer reverts everything.
+
+**`set_max_escrow_per_provider`** — caller is admin; `max` ≥ 0 (`InvalidEscrowCap`). `0`, the default, is unlimited. The cap limits what one clinic can hold in escrow across all its open vouchers, so a verified clinic that turns out to be fraudulent is exposed to at most this much. `get_exposure(provider)` returns the clinic's open voucher count and escrowed value; both fall when a voucher settles or refunds, including through `resolve_dispute`. Lowering the cap only affects new vouchers.
 
 **`claim`** — caller is the named provider; provider is still `Active` in the registry; status is `Funded`; not expired.
 
@@ -258,6 +277,9 @@ rejects the voucher's own provider even if it holds that role.
 |  |  | 18 | `ServiceUnavailable` |
 |  |  | 19 | `AttestationCapReached` |
 |  |  | 20 | `InvalidAttestationCap` |
+|  |  | 21 | `ProviderAtCapacity` |
+|  |  | 22 | `EscrowCapReached` |
+|  |  | 23 | `InvalidEscrowCap` |
 
 ### Events
 
@@ -271,6 +293,7 @@ rejects the voucher's own provider even if it holds that role.
 | `voucher_refunded` | `funder` | `voucher_id`, `amount`, `service_code` |
 | `dispute_resolved` | `admin` | `voucher_id`, `refunded_funder` |
 | `attestation_cap_changed` | `admin` | `cap` |
+| `escrow_cap_changed` | `admin` | `max` |
 
 > Fields listed under **Topics** are published in the event's topic list, **not** in its data map. An indexer reading them off the data map gets `undefined`.
 >
