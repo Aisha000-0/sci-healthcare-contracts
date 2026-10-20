@@ -151,23 +151,24 @@ jobs:
         run: |
           mkdir -p /tmp/build1
           cp -r . /tmp/build1/src
-          mkdir -p /tmp/cargo-home
-          cd /tmp/build1/src && CARGO_HOME=/tmp/cargo-home ./scripts/build-wasm.sh dist1
-          cp -r /tmp/build1/src/dist1 /tmp/build1-dist1
+          mkdir -p /tmp/cargo-home-1
+          cd /tmp/build1/src && CARGO_HOME=/tmp/cargo-home-1 ./scripts/build-wasm.sh dist1
+          mkdir -p dist1 && cp /tmp/build1/src/dist1/* dist1/
       - name: Second build
         run: |
           mkdir -p /tmp/build2
           cp -r . /tmp/build2/src
-          cd /tmp/build2/src && CARGO_HOME=/tmp/cargo-home ./scripts/build-wasm.sh dist2
-          cp -r /tmp/build2/src/dist2 /tmp/build2-dist2
+          mkdir -p /tmp/cargo-home-2
+          cd /tmp/build2/src && CARGO_HOME=/tmp/cargo-home-2 ./scripts/build-wasm.sh dist2
+          mkdir -p dist2 && cp /tmp/build2/src/dist2/* dist2/
       - name: Compare checksums
         run: |
-          if ! diff /tmp/build1-dist1/SHA256SUMS /tmp/build2-dist2/SHA256SUMS; then
+          if ! diff dist1/SHA256SUMS dist2/SHA256SUMS; then
             echo "::error::Builds are not reproducible - checksums differ"
             echo "First build:"
-            cat /tmp/build1-dist1/SHA256SUMS
+            cat dist1/SHA256SUMS
             echo "Second build:"
-            cat /tmp/build2-dist2/SHA256SUMS
+            cat dist2/SHA256SUMS
             exit 1
           fi
           echo "Builds are reproducible - checksums match"
