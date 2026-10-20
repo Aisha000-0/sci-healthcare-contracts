@@ -1,6 +1,7 @@
 # Table of contents
 
 * [What this is](README.md)
+* [Glossary of protocol terms](glossary.md)
 
 ## Protocol
 
@@ -13,6 +14,7 @@
 
 * [Funding care for someone](guides/funders.md)
 * [Running a clinic](guides/clinics.md)
+* [Clinic FAQ](guides/clinics-faq.md)
 * [Attesting delivery](guides/attesters.md)
 
 ## Developers
