@@ -147,8 +147,15 @@ jobs:
           curl -sSL "https://github.com/WebAssembly/binaryen/releases/download/version_133/binaryen-version_133-x86_64-linux.tar.gz" \
             | tar xz
           echo "$PWD/binaryen-version_133/bin" >> "$GITHUB_PATH"
-      - name: First build
+      - name: Reproducible build
         run: |
+          set -e
+          # Install wasm-opt
+          curl -sSL "https://github.com/WebAssembly/binaryen/releases/download/version_133/binaryen-version_133-x86_64-linux.tar.gz" \
+            | tar xz
+          echo "$PWD/binaryen-version_133/bin" >> "$GITHUB_PATH"
+
+          # First build
           mkdir -p /tmp/build1
           cp -r . /tmp/build1/src
           mkdir -p /tmp/cargo-home-1
@@ -159,8 +166,8 @@ jobs:
           cp -v /tmp/build1/src/dist/* dist1/
           echo "dist1 contents:"
           ls -la dist1/
-      - name: Second build
-        run: |
+
+          # Second build
           mkdir -p /tmp/build2
           cp -r . /tmp/build2/src
           mkdir -p /tmp/cargo-home-2
@@ -171,8 +178,8 @@ jobs:
           cp -v /tmp/build2/src/dist/* dist2/
           echo "dist2 contents:"
           ls -la dist2/
-      - name: Compare checksums
-        run: |
+
+          # Compare checksums
           echo "dist1 contents:"
           ls -la dist1/
           echo "dist2 contents:"
