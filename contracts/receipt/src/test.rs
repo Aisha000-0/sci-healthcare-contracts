@@ -248,3 +248,628 @@ fn only_the_nominee_can_accept_admin() {
     let err = f.client.try_accept_admin(&intruder).err().unwrap().unwrap();
     assert_eq!(err, ReceiptError::NotAuthorized);
 }
+
+// ----- authorisation matrix -----
+//
+// One row per public function: the exact signer it must demand, and nothing
+// else. The host records one entry per address a `require_auth()` was made
+// for during an invocation, so comparing `env.auths()` with the expected
+// signer catches both kinds of mistake:
+//
+//   * a missing `require_auth()` — anyone could mint a receipt, and
+//   * an extra `require_auth()` — the voucher contract could not mint one at
+//     settlement, because a contract address cannot produce a signature.
+//
+// The table in `docs/developers/contracts.md` is the rendered form of this
+// same list, and `authorisation_table_in_the_docs_matches_the_matrix` fails
+// when the two drift.
+//
+// What breaks if this is wrong: a receipt is the patient's proof that care was
+// paid for. If `mint` accepts anyone, that proof is worthless.
+
+extern crate std;
+
+use soroban_sdk::testutils::storage::Persistent as _;
+use soroban_sdk::testutils::{Events as _, Ledger as _};
+use soroban_sdk::xdr::{ContractEvent, ContractEventBody, ScVal};
+
+use crate::DataKey;
+
+const DAY_IN_LEDGERS: u32 = 17_280;
+const NINETY_DAYS: u32 = 90 * DAY_IN_LEDGERS;
+
+/// A plain fixture plus the address the `accept_admin` row needs. It is
+/// generated here rather than in `setup()` so every other test keeps the same
+/// generated addresses — and therefore the same snapshots.
+struct AuthFixture {
+    f: Fixture,
+    /// Never used as admin: the nominee for the `accept_admin` row.
+    new_admin: Address,
+}
+
+impl AuthFixture {
+    fn new() -> Self {
+        let f = setup();
+        let new_admin = Address::generate(&f.env);
+        Self { f, new_admin }
+    }
+}
+
+/// How the docs name a signer, and where the fixture keeps that address.
+#[derive(Clone, Copy)]
+struct Signer {
+    label: &'static str,
+    address: fn(&AuthFixture) -> Address,
+}
+
+/// The signers a function must demand.
+#[derive(Clone, Copy)]
+enum Auth {
+    Signer(Signer),
+    /// No signature at all; the note says why (a view, a one-shot setup).
+    Free(&'static str),
+}
+
+impl Auth {
+    fn label(&self) -> &'static str {
+        match self {
+            Auth::Signer(signer) => signer.label,
+            Auth::Free(note) => note,
+        }
+    }
+}
+
+struct AuthCase {
+    function: &'static str,
+    auth: Auth,
+}
+
+const fn signer(label: &'static str, address: fn(&AuthFixture) -> Address) -> Auth {
+    Auth::Signer(Signer { label, address })
+}
+
+fn admin_addr(f: &AuthFixture) -> Address {
+    f.f.admin.clone()
+}
+
+fn minter_addr(f: &AuthFixture) -> Address {
+    f.f.minter.clone()
+}
+
+fn new_admin_addr(f: &AuthFixture) -> Address {
+    f.new_admin.clone()
+}
+
+/// Every public function of the receipt book, in declaration order.
+const AUTH_MATRIX: &[AuthCase] = &[
+    AuthCase {
+        function: "initialize",
+        auth: Auth::Free("none (one-shot)"),
+    },
+    AuthCase {
+        function: "set_minter",
+        auth: signer("`admin`", admin_addr),
+    },
+    AuthCase {
+        function: "mint",
+        auth: signer("`minter`", minter_addr),
+    },
+    AuthCase {
+        function: "propose_admin",
+        auth: signer("`admin`", admin_addr),
+    },
+    AuthCase {
+        function: "accept_admin",
+        auth: signer("`new_admin`", new_admin_addr),
+    },
+    AuthCase {
+        function: "get_pending_admin",
+        auth: Auth::Free("none (view)"),
+    },
+    AuthCase {
+        function: "get_receipt",
+        auth: Auth::Free("none (view)"),
+    },
+    AuthCase {
+        function: "count_for",
+        auth: Auth::Free("none (view)"),
+    },
+    AuthCase {
+        function: "get_minter",
+        auth: Auth::Free("none (view)"),
+    },
+    AuthCase {
+        function: "get_admin",
+        auth: Auth::Free("none (view)"),
+    },
+];
+
+/// The signers the host recorded for the invocation that just ran.
+fn recorded_auths(env: &Env) -> std::vec::Vec<Address> {
+    env.auths()
+        .into_iter()
+        .map(|(address, _)| address)
+        .collect()
+}
+
+fn mint_one(f: &Fixture) {
+    f.client.mint(
+        &f.minter,
+        &1u64,
+        &bref(&f.env, 7),
+        &Address::generate(&f.env),
+        &101u32,
+        &30_000_000i128,
+    );
+}
+
+/// Runs `function` in the state that makes it a valid call, so the only thing
+/// under test is who it demands. Every arm leaves the function under test as
+/// the last invocation, which is what `env.auths()` reports.
+fn run_case(f: &AuthFixture, function: &str) -> std::vec::Vec<Address> {
+    let client = &f.f.client;
+    let env = &f.f.env;
+
+    match function {
+        // One-shot setup needs a fresh contract, so it cannot share the
+        // fixture: assert on an env that has never been initialised.
+        "initialize" => {
+            let env = Env::default();
+            env.mock_all_auths();
+            let a = Address::generate(&env);
+            let address = env.register(ReceiptBook, ());
+            ReceiptBookClient::new(&env, &address).initialize(&a, &a);
+            return recorded_auths(&env);
+        }
+        "set_minter" => {
+            client.set_minter(&f.f.admin, &Address::generate(env));
+        }
+        "mint" => {
+            mint_one(&f.f);
+        }
+        "propose_admin" => {
+            client.propose_admin(&f.f.admin, &f.new_admin);
+        }
+        "accept_admin" => {
+            client.propose_admin(&f.f.admin, &f.new_admin);
+            client.accept_admin(&f.new_admin);
+        }
+        "get_pending_admin" => {
+            client.get_pending_admin();
+        }
+        "get_receipt" => {
+            mint_one(&f.f);
+            client.get_receipt(&1u64);
+        }
+        "count_for" => {
+            client.count_for(&bref(env, 7));
+        }
+        "get_minter" => {
+            client.get_minter();
+        }
+        "get_admin" => {
+            client.get_admin();
+        }
+        other => {
+            panic!("no call is defined for `{other}`, so the matrix test cannot check it")
+        }
+    }
+
+    recorded_auths(env)
+}
+
+fn assert_demands(f: &AuthFixture, case: &AuthCase, got: &[Address]) {
+    match case.auth {
+        Auth::Signer(signer) => {
+            let expected = (signer.address)(f);
+            assert_eq!(
+                got.len(),
+                1,
+                "`{}` must demand exactly one signer ({}), but the host recorded {}: \
+                 a missing require_auth() would let anyone mint, and an extra one \
+                 would stop the voucher contract minting at settlement",
+                case.function,
+                signer.label,
+                got.len(),
+            );
+            assert_eq!(
+                got[0], expected,
+                "`{}` demands a different signer than the documented {}. \
+                 Changing this line without changing the contract means the contract \
+                 is not checking who it claims to check",
+                case.function, signer.label,
+            );
+        }
+        Auth::Free(note) => assert!(
+            got.is_empty(),
+            "`{}` is documented as {note}, but it demanded {} signature(s)",
+            case.function,
+            got.len(),
+        ),
+    }
+}
+
+#[test]
+fn authorisation_matrix_matches_every_public_function() {
+    for case in AUTH_MATRIX {
+        let f = AuthFixture::new();
+        let got = run_case(&f, case.function);
+        assert_demands(&f, case, &got);
+    }
+}
+
+/// The rows of the authorisation table in `docs/developers/contracts.md` for
+/// one contract, as written.
+fn doc_rows<'a>(docs: &'a str, contract: &str) -> std::vec::Vec<&'a str> {
+    let heading = std::format!("## {contract}\n");
+    let start = docs
+        .find(&heading)
+        .unwrap_or_else(|| panic!("contracts.md has no `{contract}` section"));
+    let section = &docs[start..];
+    let start = section
+        .find("### Authorisation matrix")
+        .unwrap_or_else(|| panic!("the `{contract}` section has no authorisation matrix"));
+    let section = &section[start..];
+    // The matrix is its own subsection: stop at the next heading so the
+    // errors and events tables further down are not counted as rows.
+    let end = section
+        .find("\n### ")
+        .or_else(|| section.find("\n## "))
+        .unwrap_or(section.len());
+    section[..end]
+        .lines()
+        .filter(|line| line.starts_with("| `"))
+        .collect()
+}
+
+#[test]
+fn authorisation_table_in_the_docs_matches_the_matrix() {
+    const DOCS: &str = include_str!("../../../docs/developers/contracts.md");
+
+    let rows = doc_rows(DOCS, "receipt");
+    assert_eq!(
+        rows.len(),
+        AUTH_MATRIX.len(),
+        "docs/developers/contracts.md documents {} receipt functions but the matrix has {}",
+        rows.len(),
+        AUTH_MATRIX.len(),
+    );
+    for case in AUTH_MATRIX {
+        let want = std::format!("| `{}` | {} |", case.function, case.auth.label());
+        assert!(
+            rows.contains(&want.as_str()),
+            "docs/developers/contracts.md is missing the row `{want}`. \
+             Regenerate the table from AUTH_MATRIX so the documented signer is the \
+             one the tests prove",
+        );
+    }
+}
+
+// ----- event snapshots -----
+//
+// Events are an API for the indexer in `sci-healthcare-backend`, which decodes
+// them by event name and field name. These tests read the decoded XDR event the
+// contract publishes and pin both the topic list and the data map.
+//
+// What breaks if this is wrong: a renamed field turns into `undefined` in the
+// indexer, and the patient's care history silently loses a column.
+
+/// The single event published by the last invocation, from `contract`.
+fn one_event(env: &Env, contract: &Address) -> ContractEvent {
+    let events = env.events().all().filter_by_contract(contract);
+    let list = events.events();
+    assert_eq!(
+        list.len(),
+        1,
+        "expected the invocation to publish exactly one receipt event, got {:?}",
+        list,
+    );
+    list[0].clone()
+}
+
+/// Topics of the event, as published (topic 0 is the event name).
+fn topics(e: &ContractEvent) -> &[ScVal] {
+    match &e.body {
+        ContractEventBody::V0(v0) => &v0.topics,
+    }
+}
+
+/// The event's data map, or `None` when it is not a map.
+fn data(e: &ContractEvent) -> Option<&soroban_sdk::xdr::VecM<soroban_sdk::xdr::ScMapEntry>> {
+    match &e.body {
+        ContractEventBody::V0(v0) => match &v0.data {
+            ScVal::Map(Some(map)) => Some(map),
+            _ => None,
+        },
+    }
+}
+
+fn symbol(v: &ScVal) -> Option<&str> {
+    match v {
+        ScVal::Symbol(s) => (&s.0).try_into().ok(),
+        _ => None,
+    }
+}
+
+/// The data-map keys, in the order the map carries them (an XDR map is
+/// sorted by key, so this is stable).
+fn field_names(e: &ContractEvent) -> std::vec::Vec<&str> {
+    data(e)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| symbol(&entry.key))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One field of the data map, with a descriptive failure when it is missing.
+fn field(e: &ContractEvent, name: &str) -> ScVal {
+    let entries = data(e).unwrap_or_else(|| panic!("event data is not a map: {e:?}"));
+    let found = entries
+        .iter()
+        .find(|entry| symbol(&entry.key) == Some(name))
+        .unwrap_or_else(|| {
+            let keys = field_names(e);
+            panic!(
+                "event has no `{name}` field; its fields are {keys:?}. \
+                 The indexer in sci-healthcare-backend decodes by field name \
+                 (TOPIC_FIELDS in sci-healthcare-backend/src/stellar/events.ts)",
+            )
+        });
+    found.val.clone()
+}
+
+fn field_address(env: &Env, e: &ContractEvent, name: &str) -> Address {
+    use soroban_sdk::TryFromVal;
+
+    let value = field(e, name);
+    match &value {
+        ScVal::Address(_) => Address::try_from_val(env, &value)
+            .unwrap_or_else(|_| panic!("event field `{name}` is not a usable address")),
+        other => panic!("event field `{name}` is {other:?}, want an address"),
+    }
+}
+
+fn field_u32(e: &ContractEvent, name: &str) -> u32 {
+    match field(e, name) {
+        ScVal::U32(v) => v,
+        other => panic!("event field `{name}` is {other:?}, want u32"),
+    }
+}
+
+fn field_u64(e: &ContractEvent, name: &str) -> u64 {
+    match field(e, name) {
+        ScVal::U64(v) => v,
+        other => panic!("event field `{name}` is {other:?}, want u64"),
+    }
+}
+
+fn field_i128(e: &ContractEvent, name: &str) -> i128 {
+    match field(e, name) {
+        ScVal::I128(parts) => i128::from(&parts),
+        other => panic!("event field `{name}` is {other:?}, want i128"),
+    }
+}
+
+/// Asserts the event name (topic 0), the extra topics, and the exact set of
+/// data fields — the layout an indexer decodes.
+fn assert_layout(e: &ContractEvent, name: &str, extra_topics: &[ScVal], fields: &[&str]) {
+    let published = topics(e);
+    assert_eq!(
+        published.len(),
+        1 + extra_topics.len(),
+        "event `{name}` publishes {} topics, expected {}. Topic 0 is the event \
+         name and the rest are the #[topic] fields; moving a field between the \
+         topic list and the data map is a breaking change for the indexer in \
+         sci-healthcare-backend",
+        published.len(),
+        1 + extra_topics.len(),
+    );
+    assert_eq!(
+        symbol(&published[0]),
+        Some(name),
+        "topic 0 names the event; renaming it breaks the decoder in \
+         sci-healthcare-backend/src/stellar/events.ts",
+    );
+    for (index, want) in extra_topics.iter().enumerate() {
+        assert_eq!(
+            &published[index + 1],
+            want,
+            "topic {} of `{name}` changed; the indexer matches topics by position, \
+             so this needs a matching change in sci-healthcare-backend/src/stellar/events.ts",
+            index + 1,
+        );
+    }
+
+    let mut want_fields: std::vec::Vec<&str> = fields.to_vec();
+    want_fields.sort_unstable();
+    assert_eq!(
+        field_names(e),
+        want_fields,
+        "the data map of `{name}` changed. This is the layout the indexer decodes \
+         (TOPIC_FIELDS in sci-healthcare-backend/src/stellar/events.ts); \
+         update the decoder in the same change set or restore the field",
+    );
+}
+
+#[test]
+fn initialized_event_snapshot() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let minter = Address::generate(&env);
+    let address = env.register(ReceiptBook, ());
+    ReceiptBookClient::new(&env, &address).initialize(&admin, &minter);
+
+    let e = one_event(&env, &address);
+    assert_layout(&e, "initialized", &[], &["admin"]);
+    assert_eq!(field_address(&env, &e, "admin"), admin);
+}
+
+#[test]
+fn minter_changed_event_snapshot() {
+    let f = setup();
+    let new_minter = Address::generate(&f.env);
+
+    f.client.set_minter(&f.admin, &new_minter);
+
+    let e = one_event(&f.env, &f.client.address);
+    // `minter` is data, not a topic: an indexer reading it from the topic list
+    // gets undefined, so the layout is pinned here.
+    assert_layout(&e, "minter_changed", &[], &["minter"]);
+    assert_eq!(field_address(&f.env, &e, "minter"), new_minter);
+}
+
+#[test]
+fn receipt_minted_event_snapshot() {
+    let f = setup();
+    let provider = Address::generate(&f.env);
+    let patient = bref(&f.env, 7);
+
+    f.client.mint(
+        &f.minter,
+        &1u64,
+        &patient,
+        &provider,
+        &101u32,
+        &30_000_000i128,
+    );
+
+    let e = one_event(&f.env, &f.client.address);
+    assert_layout(
+        &e,
+        "receipt_minted",
+        &[ScVal::from(&patient), ScVal::from(&provider)],
+        &["voucher_id", "service_code", "amount", "settled_at"],
+    );
+    assert_eq!(field_u64(&e, "voucher_id"), 1);
+    assert_eq!(field_u32(&e, "service_code"), 101);
+    assert_eq!(field_i128(&e, "amount"), 30_000_000);
+    assert_eq!(field_u64(&e, "settled_at"), 0);
+}
+
+#[test]
+fn admin_proposed_event_snapshot() {
+    let f = setup();
+    let nominee = Address::generate(&f.env);
+
+    f.client.propose_admin(&f.admin, &nominee);
+
+    let e = one_event(&f.env, &f.client.address);
+    assert_layout(
+        &e,
+        "admin_proposed",
+        &[ScVal::from(&f.admin)],
+        &["pending_admin"],
+    );
+    assert_eq!(field_address(&f.env, &e, "pending_admin"), nominee);
+}
+
+#[test]
+fn admin_changed_event_snapshot() {
+    let f = setup();
+    let new_admin = Address::generate(&f.env);
+    f.client.propose_admin(&f.admin, &new_admin);
+
+    f.client.accept_admin(&new_admin);
+
+    let e = one_event(&f.env, &f.client.address);
+    assert_layout(&e, "admin_changed", &[], &["new_admin"]);
+    assert_eq!(field_address(&f.env, &e, "new_admin"), new_admin);
+}
+
+// ----- storage lifetime (TTL) -----
+//
+// A receipt is the patient's proof that care was paid for. It is only worth
+// anything if it outlives the voucher, so these tests jump the ledger past the
+// contract's own thresholds and prove the entries are still there.
+//
+// What breaks if this is wrong: a receipt that lapses has to be restored before
+// it can be read, and a patient asking for their history pays for that.
+
+fn advance_days(f: &Fixture, days: u32) {
+    f.env.ledger().with_mut(|li| {
+        li.sequence_number += days * DAY_IN_LEDGERS;
+        li.timestamp += u64::from(days) * 24 * 60 * 60;
+    });
+}
+
+fn receipt_ttl(f: &Fixture, voucher_id: u64) -> u32 {
+    let contract = f.client.address.clone();
+    let key = DataKey::Receipt(voucher_id);
+    f.env
+        .as_contract(&contract, || f.env.storage().persistent().get_ttl(&key))
+}
+
+fn count_ttl(f: &Fixture, beneficiary: &BytesN<32>) -> u32 {
+    let contract = f.client.address.clone();
+    let key = DataKey::Count(beneficiary.clone());
+    f.env
+        .as_contract(&contract, || f.env.storage().persistent().get_ttl(&key))
+}
+
+#[test]
+fn receipt_survives_sixty_days_of_activity() {
+    let f = setup();
+    let provider = Address::generate(&f.env);
+    let patient = bref(&f.env, 7);
+    f.client
+        .mint(&f.minter, &1u64, &patient, &provider, &101u32, &30_000_000);
+
+    // Ten days at a time, the way the app lists a patient's history.
+    for day in 1..=6 {
+        advance_days(&f, 10);
+        let r = f.client.get_receipt(&1u64);
+        assert_eq!(
+            r.amount,
+            30_000_000,
+            "the receipt was archived on day {}",
+            day * 10
+        );
+        assert_eq!(r.provider, provider);
+        assert_eq!(f.client.count_for(&patient), 1);
+    }
+
+    // Day 60: the read above crossed the 30-day threshold and pushed the
+    // entry back out to a full 90 days.
+    assert_eq!(receipt_ttl(&f, 1), NINETY_DAYS);
+}
+
+#[test]
+fn receipt_read_restores_a_lapsed_entry() {
+    let f = setup();
+    let provider = Address::generate(&f.env);
+    let patient = bref(&f.env, 7);
+    f.client
+        .mint(&f.minter, &1u64, &patient, &provider, &101u32, &30_000_000);
+
+    // 95 days of silence: past the 90-day TTL the mint set on the receipt.
+    advance_days(&f, 95);
+
+    // The host restores the lapsed entry on the first read; the contract's
+    // read path then extends it again. Nothing is lost.
+    assert_eq!(f.client.get_receipt(&1u64).amount, 30_000_000);
+    assert_eq!(receipt_ttl(&f, 1), NINETY_DAYS);
+    assert_eq!(f.client.count_for(&patient), 1);
+}
+
+#[test]
+fn count_for_extends_its_own_entry() {
+    let f = setup();
+    let provider = Address::generate(&f.env);
+    let patient = bref(&f.env, 7);
+    f.client
+        .mint(&f.minter, &1u64, &patient, &provider, &101u32, &30_000_000);
+
+    // Day 61: the counter has crossed the 30-day threshold. Only a read of
+    // `count_for` can extend it — the receipt's own TTL does not cover it.
+    advance_days(&f, 61);
+    assert_eq!(f.client.count_for(&patient), 1);
+    assert_eq!(count_ttl(&f, &patient), NINETY_DAYS);
+
+    // And an unknown beneficiary is still an ordinary zero, not an error.
+    advance_days(&f, 30);
+    assert_eq!(f.client.count_for(&bref(&f.env, 9)), 0);
+}

@@ -37,7 +37,7 @@ cargo install --locked wasm-opt   # or download binaryen 133 from GitHub release
 git clone https://github.com/Godgift-care/sci-healthcare-contracts
 cd sci-healthcare-contracts
 
-cargo test                                    # 100 tests
+cargo test                                    # 135 tests
 cargo build --target wasm32v1-none --release
 ./scripts/build-wasm.sh                       # the release build: optimised wasm + SHA256SUMS
 ```
@@ -62,6 +62,40 @@ done
 `deploy.sh` deploys in dependency order — registry and receipt first, then voucher — initialises each, points the receipt book at the voucher contract, and writes every address to `deployments/testnet.env`. Re-running it refuses to overwrite an existing env file unless you pass `--force`; use `--dry-run` to preview without building, deploying or sending a transaction. `scripts/test-deploy.sh` covers both behaviours.
 
 `seed.sh` creates a demo clinic with three services, authorises an attester, and funds two vouchers.
+
+The default dispute window is 72 hours, so the seeded voucher 1 stays `Attested`
+for three days before it can settle. That is the state the end-to-end check
+asserts on.
+
+### The end-to-end check on a real node
+
+`cargo test` runs everything in an in-process host. It never touches the CLI,
+the RPC or the shell scripts, so it cannot notice that `deploy.sh` started
+passing a flag the CLI no longer accepts. `scripts/e2e-local.sh` closes that gap
+by running the real thing against a standalone node:
+
+```bash
+docker run --rm -d -p 8000:8000 --name stellar stellar/quickstart:latest --local
+./scripts/e2e-local.sh
+```
+
+The script waits for the node, registers it with the CLI as `local`, creates
+and funds the five identities `deploy.sh` and `seed.sh` expect, runs both
+scripts, and then reads voucher 1 back from the chain and asserts it is
+`Attested`. It prints a banner before every step and names the step that failed,
+so a red job says where it stopped.
+
+Addresses land in `deployments/local.env` (gitignored). Re-running the script
+against the same node deploys again with `--force`; stop and remove the
+container to start from a clean ledger:
+
+```bash
+docker stop stellar
+```
+
+`.github/workflows/e2e-local.yml` runs exactly this on every push to `main`,
+because pulling the image and building the release wasm makes it the slowest
+job here. It is not part of the pull request checks.
 
 ### The testnet dispute window
 

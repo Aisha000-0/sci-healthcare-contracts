@@ -60,6 +60,32 @@ pub struct ServiceItem {
 
 `get_service_price` returns `0` when the service is absent or inactive. It exists so `voucher` can validate pricing over an interface of primitives only, without the two contracts sharing types.
 
+### Authorisation matrix
+
+Every public function, with the exact signer it demands — no signature that is missing, and none that is extra. The table is rendered from the `AUTH_MATRIX` list in `contracts/registry/src/test.rs`; `authorisation_matrix_matches_every_public_function` calls each row and asserts `env.auths()` holds precisely that address, and `authorisation_table_in_the_docs_matches_the_matrix` fails if this table and that list disagree.
+
+| Function | Signer required |
+| --- | --- |
+| `initialize` | none (one-shot) |
+| `register_provider` | `owner` |
+| `set_provider_status` | `admin` |
+| `upsert_service` | `provider_addr` |
+| `remove_service` | `provider_addr` |
+| `add_attester` | `admin` |
+| `remove_attester` | `admin` |
+| `propose_admin` | `admin` |
+| `accept_admin` | `new_admin` |
+| `get_admin` | none (view) |
+| `get_pending_admin` | none (view) |
+| `get_provider` | none (view) |
+| `is_active_provider` | none (view) |
+| `get_service` | none (view) |
+| `get_services` | none (view) |
+| `get_service_price` | none (view) |
+| `is_attester` | none (view) |
+
+A signer is not the same as a role: `admin` must be the stored admin **and** sign, and the two checks are ordered so a wrong `admin` argument fails before any signature is requested.
+
 ### Errors
 
 | # | Variant |
@@ -135,6 +161,34 @@ pub struct Voucher {
 
 `settle` and `refund` take no authorisation deliberately: a clinic that has delivered attested care must never depend on the funder or an operator to be paid.
 
+### Authorisation matrix
+
+Every public function, with the exact signer it demands. `AUTH_MATRIX` in `contracts/voucher/src/test.rs` drives both `authorisation_matrix_matches_every_public_function` — which calls each row and asserts `env.auths()` holds exactly that address — and this table, through `authorisation_table_in_the_docs_matches_the_matrix`.
+
+| Function | Signer required |
+| --- | --- |
+| `initialize` | none (one-shot) |
+| `create_voucher` | `funder` |
+| `claim` | `provider` |
+| `attest` | `attester` |
+| `dispute` | `funder` |
+| `settle` | none (permissionless) |
+| `refund` | none (permissionless) |
+| `resolve_dispute` | `admin` |
+| `propose_admin` | `admin` |
+| `accept_admin` | `new_admin` |
+| `get_pending_admin` | none (view) |
+| `refundable_at` | none (view) |
+| `get_voucher` | none (view) |
+| `get_config` | none (view) |
+| `next_voucher_id` | none (view) |
+| `quote` | none (view) |
+
+`settle` and `refund` are the two permissionless rows, and that is the point:
+anyone may trigger them, so a provider is never dependent on the funder or an
+operator to be paid. `attest` demands an attester — and the contract separately
+rejects the voucher's own provider even if it holds that role.
+
 ### What each function checks
 
 **`create_voucher`** — amount > 0; expiry in the future; provider is `Active`; the service exists and is active; amount ≥ listed price. Transfers the token *before* writing the voucher, so a failed transfer reverts everything.
@@ -181,6 +235,8 @@ pub struct Voucher {
 
 > Fields listed under **Topics** are published in the event's topic list, **not** in its data map. An indexer reading them off the data map gets `undefined`.
 >
+> Every event in this table has a snapshot test that reads the decoded XDR and asserts the exact topic list and data map — `*_event_snapshot` in each contract's `src/test.rs`. Changing a field name, moving a field between topic and data, or adding a field fails that test with a message naming `TOPIC_FIELDS` in `sci-healthcare-backend/src/stellar/events.ts`.
+>
 > Every lifecycle event now carries `service_code` and `amount`, appended **after** the fields each event already had, so one event says what was paid for without a storage lookup. The data map is keyed by field name (an XDR `ScMap`), and existing fields keep their positions: decoders that read by name — including `sci-healthcare-backend` — pick the new fields up without a breaking change. `voucher_refunded` already carried `amount`; it gains `service_code` only.
 
 ---
@@ -215,6 +271,23 @@ pub struct Receipt {
 | `get_admin` | — | `Address` | view |
 
 Only the minter — the voucher contract — may mint. Because the voucher contract does not exist when the receipt book is initialised, deploy order is: receipt, voucher, then `set_minter`.
+
+### Authorisation matrix
+
+Every public function, with the exact signer it demands. `AUTH_MATRIX` in `contracts/receipt/src/test.rs` drives both `authorisation_matrix_matches_every_public_function` and this table.
+
+| Function | Signer required |
+| --- | --- |
+| `initialize` | none (one-shot) |
+| `set_minter` | `admin` |
+| `mint` | `minter` |
+| `propose_admin` | `admin` |
+| `accept_admin` | `new_admin` |
+| `get_pending_admin` | none (view) |
+| `get_receipt` | none (view) |
+| `count_for` | none (view) |
+| `get_minter` | none (view) |
+| `get_admin` | none (view) |
 
 ### Errors
 
@@ -256,6 +329,60 @@ On testnet the faucet drips 50 USDC once a day: [`CCB25WG7DQ2CSNXPTOHZO2PDZ324FQ
 | 3 | `NotAuthorized` |
 | 4 | `InvalidAmount` |
 | 5 | `CoolingDown` |
+
+---
+
+## Storage lifetime (TTL)
+
+Soroban does not keep an entry forever. Every persistent entry carries a
+*time to live* measured in ledgers, and an entry that runs out is archived: it
+leaves the live ledger, and the next caller that needs it has to restore it
+first. At roughly five seconds per ledger, 17,280 ledgers is a day.
+
+Every contract extends the TTL of what it touches, so what is in normal use
+stays in the live ledger. These are the numbers, all in ledgers:
+
+| Entry | Durability | Extended when | Threshold | Extend to |
+| --- | --- | --- | --- | --- |
+| Contract instance (config, admin, id counter) — all contracts | instance | every write | 7 days | 30 days |
+| `Voucher(id)` | persistent | every read and write | 30 days | 90 days |
+| `Provider`, `Service`, `Attester` | persistent | every read and write | 30 days | 90 days |
+| `Receipt(id)`, `Count(beneficiary_ref)` | persistent | every read and write | 30 days | 90 days |
+| Faucet `LastDrip(address)` | temporary | every drip | 1 day | 7 days |
+
+"Extended when" is a threshold, not a refresh on every call: the TTL is only
+pushed back out once the remaining life drops below the threshold. A read on
+day 10 of a 90-day entry does nothing; a read on day 61 of the same entry
+resets it to 90 days.
+
+### What happens to an entry nobody touches
+
+**A voucher that is never read, claimed or refunded has lapsed by day 90.**
+The contract instance around it may still be alive — other vouchers keep that
+extended — but the voucher's own entry is gone from the live ledger. The money
+is not lost and the voucher is not invalidated. Since protocol 23 a lapsed
+persistent entry is *restored* rather than refused: the read that needs it
+recreates it from the archive, and the entry comes back with the network's
+minimum persistent TTL (`4096` ledgers in the test environment) before the
+contract's own read path extends it again.
+
+That restore is not free. The caller pays a restore fee, and on a real network
+the RPC has to include the entry in the transaction's restore set. So the
+practical rule for a funder who funded a voucher and forgot about it for three
+months: the refund still works, but it costs a little more. `scripts/` and the
+app should read a voucher before operating on it rather than after.
+
+These expectations are tested, not assumed:
+
+- `contracts/voucher/src/test.rs` — `live_voucher_survives_sixty_days_of_activity`,
+  `settled_voucher_and_its_receipt_survive_sixty_days_of_activity`,
+  `abandoned_voucher_is_restored_and_still_refunds`,
+  `contract_instance_survives_sixty_days_of_writes` and
+  `writes_extend_the_contract_instance`.
+- `contracts/registry/src/test.rs` — `provider_service_and_attester_survive_sixty_days_of_activity`
+  and `registry_reads_restore_a_lapsed_entry`.
+- `contracts/receipt/src/test.rs` — `receipt_survives_sixty_days_of_activity`,
+  `receipt_read_restores_a_lapsed_entry` and `count_for_extends_its_own_entry`.
 
 ---
 
@@ -369,7 +496,7 @@ directory.
 ### Coverage
 
 CI measures coverage with `cargo llvm-cov` and fails when it drops. The
-contract sources are at **98.14% of lines** and **95.99% of regions**; the
+contract sources are at **98.14% of lines** and **96.01% of regions**; the
 thresholds in `.github/workflows/ci.yml` sit just under, at 98% and 95%. Test
 files are excluded from the measurement: the number that matters is how much of
 the contract code the tests reach. Raise the threshold in the same pull
