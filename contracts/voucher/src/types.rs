@@ -50,6 +50,22 @@ pub struct Voucher {
     pub dispute_deadline: u64,
 }
 
+/// Optional terms a funder can attach to a voucher with
+/// `create_voucher_with_options`. Both default to off, and a voucher funded
+/// with `create_voucher` behaves exactly as before.
+#[contracttype]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct VoucherOptions {
+    /// SHA-256 of a secret the funder gives the patient. When set, the clinic
+    /// can only claim with `claim_with_proof`, revealing the secret, which
+    /// shows it had the patient in front of it.
+    pub presence_commitment: Option<BytesN<32>>,
+    /// Seconds the funder has to dispute after attestation, in place of the
+    /// protocol-wide `Config.dispute_window`. Must lie within the dispute
+    /// window bounds.
+    pub dispute_window: Option<u64>,
+}
+
 /// Protocol-level settings, fixed at initialization.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -80,6 +96,12 @@ pub enum DataKey {
     /// Attestations made by an attester on a UTC day (`timestamp / 86400`).
     /// Temporary storage: it only has to outlive the day it counts.
     Attestations(Address, u64),
+    /// A voucher's `VoucherOptions`. Written only for vouchers that set one,
+    /// so a plain voucher pays for no extra storage.
+    Options(u64),
+    /// Shortest and longest per-voucher dispute window a funder may choose.
+    /// Unset means `DEFAULT_DISPUTE_WINDOW_BOUNDS`.
+    DisputeWindowBounds,
 }
 
 #[contracterror]
@@ -111,6 +133,16 @@ pub enum VoucherError {
     AttestationCapReached = 19,
     /// The attestation cap must be at least 1.
     InvalidAttestationCap = 20,
+    /// This voucher was funded with a presence commitment, so the clinic must
+    /// claim it with `claim_with_proof`.
+    PresenceProofRequired = 21,
+    /// The secret does not hash to the voucher's presence commitment.
+    InvalidPresenceProof = 22,
+    /// `claim_with_proof` on a voucher funded without a presence commitment.
+    NoPresenceCommitment = 23,
+    /// The chosen dispute window is outside the allowed bounds, or the bounds
+    /// themselves are invalid.
+    InvalidDisputeWindow = 24,
 }
 
 /// Maps the shared helpers' failures onto this contract's error numbers, so

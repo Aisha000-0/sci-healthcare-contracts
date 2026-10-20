@@ -114,6 +114,17 @@ pub struct AttestationCapChanged {
     pub cap: u32,
 }
 
+/// The admin changed the range a funder's per-voucher dispute window must
+/// fall in.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeWindowBoundsChanged {
+    #[topic]
+    pub admin: Address,
+    pub min: u64,
+    pub max: u64,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminProposed {

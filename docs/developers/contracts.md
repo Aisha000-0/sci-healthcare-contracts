@@ -159,7 +159,14 @@ pub struct Voucher {
     pub attested_at: u64,
     pub dispute_deadline: u64,
 }
+
+pub struct VoucherOptions {                       // create_voucher_with_options
+    pub presence_commitment: Option<BytesN<32>>,  // sha256 of the patient's secret
+    pub dispute_window: Option<u64>,              // per-voucher window, within the bounds
+}
 ```
+
+`Voucher` is what every function takes and returns. In storage it is kept positionally — an XDR vec of its values, without the id, which is already in the key — rather than as a map carrying every field name; for an attested voucher that is 228 bytes instead of 464, about half, and rent is charged on entry size (`stored_voucher_is_smaller_than_the_named_layout` prints both). `VoucherOptions` lives in its own entry, written only for a voucher that sets one.
 
 ### Functions
 
@@ -167,16 +174,21 @@ pub struct Voucher {
 | --- | --- | --- | --- |
 | `initialize` | `admin, registry, receipt_book, token, dispute_window, fee_bps, fee_account` | `()` | once |
 | `create_voucher` | `funder, beneficiary_ref, provider, service_code, amount, expires_at` | `u64` | `funder` |
+| `create_voucher_with_options` | `funder, beneficiary_ref, provider, service_code, amount, expires_at, options: VoucherOptions` | `u64` | `funder` |
 | `claim` | `provider, voucher_id` | `()` | `provider` |
+| `claim_with_proof` | `provider, voucher_id, secret: Bytes` | `()` | `provider` |
 | `attest` | `attester, voucher_id` | `()` | `attester` |
 | `dispute` | `funder, voucher_id, reason_code` | `()` | `funder` |
 | `settle` | `voucher_id` | `()` | **none** |
 | `refund` | `voucher_id` | `()` | **none** |
 | `resolve_dispute` | `admin, voucher_id, refund_funder: bool` | `()` | `admin` |
 | `set_attestation_cap` | `admin, cap: u32` | `()` | `admin` |
+| `set_dispute_window_bounds` | `admin, min: u64, max: u64` | `()` | `admin` |
 | `propose_admin` | `admin, new_admin` | `()` | `admin` |
 | `accept_admin` | `new_admin` | `()` | `new_admin` |
 | `get_voucher` | `voucher_id` | `Voucher` | view |
+| `get_voucher_options` | `voucher_id` | `VoucherOptions` | view |
+| `get_dispute_window_bounds` | — | `(u64, u64)` | view |
 | `refundable_at` | `voucher_id` | `u64` | view |
 | `get_attestation_cap` | — | `u32` | view |
 | `attestations_left` | `attester` | `u32` | view |
@@ -198,15 +210,20 @@ Every public function, with the exact signer it demands. `AUTH_MATRIX` in `contr
 | --- | --- |
 | `initialize` | none (one-shot) |
 | `create_voucher` | `funder` |
+| `create_voucher_with_options` | `funder` |
 | `claim` | `provider` |
+| `claim_with_proof` | `provider` |
 | `attest` | `attester` |
 | `dispute` | `funder` |
 | `settle` | none (permissionless) |
 | `refund` | none (permissionless) |
 | `resolve_dispute` | `admin` |
 | `set_attestation_cap` | `admin` |
+| `set_dispute_window_bounds` | `admin` |
 | `propose_admin` | `admin` |
 | `accept_admin` | `new_admin` |
+| `get_dispute_window_bounds` | none (view) |
+| `get_voucher_options` | none (view) |
 | `get_attestation_cap` | none (view) |
 | `attestations_left` | none (view) |
 | `get_pending_admin` | none (view) |
@@ -226,9 +243,15 @@ rejects the voucher's own provider even if it holds that role.
 
 **`create_voucher`** — amount > 0; expiry in the future; provider is `Active`; the service exists and is active; amount ≥ listed price; the service is not paused (`ServiceUnavailable`). Transfers the token *before* writing the voucher, so a failed transfer reverts everything.
 
-**`claim`** — caller is the named provider; provider is still `Active` in the registry; status is `Funded`; not expired.
+**`create_voucher_with_options`** — everything `create_voucher` checks, plus: a `dispute_window`, when set, lies within `get_dispute_window_bounds()` (`InvalidDisputeWindow`). With both options unset it is exactly `create_voucher`.
 
-**`attest`** — caller is a registry attester; caller is **not** the provider; status is `Claimed`; the attester has attestations left today. Sets `dispute_deadline = now + dispute_window`.
+**`claim`** — caller is the named provider; provider is still `Active` in the registry; status is `Funded`; not expired; the voucher has no presence commitment (`PresenceProofRequired`).
+
+**`claim_with_proof`** — the same checks as `claim`, for a voucher funded with a `presence_commitment`: `sha256(secret)` must equal it (`InvalidPresenceProof`), and a voucher without one is `NoPresenceCommitment`. The funder gives the secret to the patient, so a claim shows the clinic had the patient in front of it rather than only saying so. The secret becomes public with the claim; it was only ever good for that voucher.
+
+**`attest`** — caller is a registry attester; caller is **not** the provider; status is `Claimed`; the attester has attestations left today. Sets `dispute_deadline = now + window`, where `window` is the voucher's own `dispute_window` if it was funded with one and `Config.dispute_window` otherwise.
+
+**`set_dispute_window_bounds`** — caller is admin; `1 ≤ min ≤ max` (`InvalidDisputeWindow`). The range a funder's per-voucher window must fall in; `DEFAULT_DISPUTE_WINDOW_BOUNDS` is one day to thirty. Applies to vouchers funded afterwards. Emits `dispute_window_bounds_changed`.
 
 **`set_attestation_cap`** — caller is admin; `cap` ≥ 1 (`InvalidAttestationCap`). Each attester may attest at most `cap` vouchers per UTC day (`timestamp / 86400`); the next is rejected with `AttestationCapReached` until midnight UTC, when the counter resets. The default is `DEFAULT_MAX_ATTESTATIONS_PER_DAY` (100). Counters live in temporary storage keyed by `(attester, day)`. The cap bounds what a stolen attester key can confirm before the admin removes it from the registry; `attestations_left(attester)` and the `remaining_today` field of `voucher_attested` show how close an attester is.
 
@@ -258,6 +281,10 @@ rejects the voucher's own provider even if it holds that role.
 |  |  | 18 | `ServiceUnavailable` |
 |  |  | 19 | `AttestationCapReached` |
 |  |  | 20 | `InvalidAttestationCap` |
+|  |  | 21 | `PresenceProofRequired` |
+|  |  | 22 | `InvalidPresenceProof` |
+|  |  | 23 | `NoPresenceCommitment` |
+|  |  | 24 | `InvalidDisputeWindow` |
 
 ### Events
 
@@ -271,6 +298,7 @@ rejects the voucher's own provider even if it holds that role.
 | `voucher_refunded` | `funder` | `voucher_id`, `amount`, `service_code` |
 | `dispute_resolved` | `admin` | `voucher_id`, `refunded_funder` |
 | `attestation_cap_changed` | `admin` | `cap` |
+| `dispute_window_bounds_changed` | `admin` | `min`, `max` |
 
 > Fields listed under **Topics** are published in the event's topic list, **not** in its data map. An indexer reading them off the data map gets `undefined`.
 >
