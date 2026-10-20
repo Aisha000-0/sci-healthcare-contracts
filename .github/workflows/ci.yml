@@ -149,12 +149,11 @@ jobs:
           echo "$PWD/binaryen-version_133/bin" >> "$GITHUB_PATH"
       - name: First build
         run: |
-          mkdir -p /tmp/cargo-home-1
-          CARGO_HOME=/tmp/cargo-home-1 ./scripts/build-wasm.sh dist1
+          mkdir -p /tmp/cargo-home
+          CARGO_HOME=/tmp/cargo-home ./scripts/build-wasm.sh dist1
       - name: Second build
         run: |
-          mkdir -p /tmp/cargo-home-2
-          CARGO_HOME=/tmp/cargo-home-2 ./scripts/build-wasm.sh dist2
+          CARGO_HOME=/tmp/cargo-home ./scripts/build-wasm.sh dist2
       - name: Compare checksums
         run: |
           if ! diff dist1/SHA256SUMS dist2/SHA256SUMS; then
