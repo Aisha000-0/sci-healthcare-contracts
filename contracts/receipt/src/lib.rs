@@ -267,11 +267,23 @@ impl ReceiptBook {
     }
 
     /// How many settled care episodes this beneficiary reference has.
+    ///
+    /// Extends the counter's TTL like every other persistent read: a patient
+    /// who keeps being treated must not have their history archived out from
+    /// under them because only the receipt entries were being extended.
     pub fn count_for(env: Env, beneficiary_ref: BytesN<32>) -> u32 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Count(beneficiary_ref))
-            .unwrap_or(0)
+        let key = DataKey::Count(beneficiary_ref);
+        match env.storage().persistent().get::<_, u32>(&key) {
+            Some(count) => {
+                env.storage().persistent().extend_ttl(
+                    &key,
+                    PERSISTENT_TTL_THRESHOLD,
+                    PERSISTENT_TTL_EXTEND,
+                );
+                count
+            }
+            None => 0,
+        }
     }
 
     pub fn get_minter(env: Env) -> Result<Address, ReceiptError> {
