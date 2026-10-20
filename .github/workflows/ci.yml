@@ -151,6 +151,8 @@ jobs:
         run: |
           mkdir -p /tmp/cargo-home
           CARGO_HOME=/tmp/cargo-home ./scripts/build-wasm.sh dist1
+      - name: Clean target directory
+        run: rm -rf target
       - name: Second build
         run: |
           CARGO_HOME=/tmp/cargo-home ./scripts/build-wasm.sh dist2
