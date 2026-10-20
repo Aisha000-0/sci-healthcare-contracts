@@ -17,6 +17,7 @@ mod types;
 #[cfg(test)]
 mod test;
 
+use sci_common as common;
 use soroban_sdk::{contract, contractimpl, Address, Env, String, Vec};
 
 pub use events::{
@@ -27,9 +28,9 @@ pub use events::{
 pub use types::{DataKey, Provider, ProviderStatus, RegistryError, ServiceItem};
 
 use storage::{
-    clear_pending_admin, extend_instance, has_admin, has_provider, read_admin, read_attester,
-    read_pending_admin, read_provider, read_service, remove_service as storage_remove_service,
-    write_admin, write_attester, write_pending_admin, write_provider, write_service,
+    extend_instance, has_admin, has_provider, read_admin, read_attester, read_pending_admin,
+    read_provider, read_service, remove_service as storage_remove_service, write_admin,
+    write_attester, write_provider, write_service,
 };
 
 /// Least notice a clinic must give before a scheduled price takes effect.
@@ -316,8 +317,7 @@ impl Registry {
         new_admin: Address,
     ) -> Result<(), RegistryError> {
         Self::require_admin(&env, &admin)?;
-        write_pending_admin(&env, &new_admin);
-        extend_instance(&env);
+        common::propose_admin(&env, &DataKey::PendingAdmin, &new_admin);
         AdminProposed {
             admin,
             pending_admin: new_admin,
@@ -328,15 +328,8 @@ impl Registry {
 
     /// The nominated address accepts and becomes admin.
     pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), RegistryError> {
-        let pending = read_pending_admin(&env).ok_or(RegistryError::NoPendingAdmin)?;
-        if pending != new_admin {
-            return Err(RegistryError::NotAuthorized);
-        }
-        new_admin.require_auth();
-
+        let new_admin = common::take_pending_admin(&env, &DataKey::PendingAdmin, &new_admin)?;
         write_admin(&env, &new_admin);
-        clear_pending_admin(&env);
-        extend_instance(&env);
         AdminChanged { new_admin }.publish(&env);
         Ok(())
     }
@@ -440,10 +433,7 @@ impl Registry {
 
     fn require_admin(env: &Env, admin: &Address) -> Result<(), RegistryError> {
         let stored = read_admin(env)?;
-        if stored != *admin {
-            return Err(RegistryError::NotAuthorized);
-        }
-        admin.require_auth();
+        common::require_admin(&stored, admin)?;
         Ok(())
     }
 }

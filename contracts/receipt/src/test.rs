@@ -2,7 +2,7 @@
 
 use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, String};
 
-use crate::{ReceiptBook, ReceiptBookClient, ReceiptError};
+use crate::{ReceiptBook, ReceiptBookClient, ReceiptError, MAX_RECEIPTS_PAGE};
 
 struct Fixture {
     env: Env,
@@ -180,6 +180,112 @@ fn count_tracks_episodes_per_beneficiary() {
 }
 
 #[test]
+fn provider_receipts_are_in_mint_order_and_never_mix() {
+    let f = setup();
+    let clinic_a = Address::generate(&f.env);
+    let clinic_b = Address::generate(&f.env);
+    let patient = bref(&f.env, 7);
+
+    // Interleave the two clinics' receipts: the index must keep each
+    // clinic's own order, not the global mint order.
+    f.client
+        .mint(&f.minter, &1u64, &patient, &clinic_a, &101u32, &10i128);
+    f.client
+        .mint(&f.minter, &2u64, &patient, &clinic_b, &101u32, &20i128);
+    f.client
+        .mint(&f.minter, &3u64, &patient, &clinic_a, &202u32, &30i128);
+    f.client
+        .mint(&f.minter, &4u64, &patient, &clinic_b, &202u32, &40i128);
+
+    let a = f.client.receipts_of_provider(&clinic_a, &0u32, &10u32);
+    assert_eq!(a.len(), 2);
+    assert_eq!(a.get(0).unwrap().voucher_id, 1);
+    assert_eq!(a.get(1).unwrap().voucher_id, 3);
+
+    let b = f.client.receipts_of_provider(&clinic_b, &0u32, &10u32);
+    assert_eq!(b.len(), 2);
+    assert_eq!(b.get(0).unwrap().voucher_id, 2);
+    assert_eq!(b.get(1).unwrap().voucher_id, 4);
+
+    // A clinic with no receipts gets an empty list, not another's history.
+    let clinic_c = Address::generate(&f.env);
+    assert_eq!(
+        f.client
+            .receipts_of_provider(&clinic_c, &0u32, &10u32)
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn provider_receipts_page_and_cap_the_limit() {
+    let f = setup();
+    let provider = Address::generate(&f.env);
+    let patient = bref(&f.env, 7);
+
+    for id in 1..=60u64 {
+        f.client
+            .mint(&f.minter, &id, &patient, &provider, &101u32, &10i128);
+    }
+
+    // A limit above MAX_RECEIPTS_PAGE is capped.
+    let first = f.client.receipts_of_provider(&provider, &0u32, &u32::MAX);
+    assert_eq!(first.len(), MAX_RECEIPTS_PAGE);
+    assert_eq!(first.get(0).unwrap().voucher_id, 1);
+    assert_eq!(first.get(49).unwrap().voucher_id, 50);
+
+    // The next page continues in mint order.
+    let second = f.client.receipts_of_provider(&provider, &50u32, &50u32);
+    assert_eq!(second.len(), 10);
+    assert_eq!(second.get(0).unwrap().voucher_id, 51);
+    assert_eq!(second.get(9).unwrap().voucher_id, 60);
+
+    // Zero, a start past the end, and an exact end are all empty.
+    assert_eq!(
+        f.client.receipts_of_provider(&provider, &0u32, &0u32).len(),
+        0
+    );
+    assert_eq!(
+        f.client
+            .receipts_of_provider(&provider, &60u32, &10u32)
+            .len(),
+        0
+    );
+    assert_eq!(
+        f.client
+            .receipts_of_provider(&provider, &999u32, &10u32)
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn provider_index_skips_a_corrupted_entry() {
+    // The index is written by `mint` and should always be complete. If a
+    // bug ever leaves a hole, one bad entry must not make the rest of a
+    // clinic's history unreadable.
+    let f = setup();
+    let provider = Address::generate(&f.env);
+    let patient = bref(&f.env, 7);
+    f.client
+        .mint(&f.minter, &1u64, &patient, &provider, &101u32, &10i128);
+    f.client
+        .mint(&f.minter, &2u64, &patient, &provider, &101u32, &20i128);
+
+    let contract = f.client.address.clone();
+    f.env.as_contract(&contract, || {
+        f.env
+            .storage()
+            .persistent()
+            .remove(&DataKey::ProviderReceipt(provider.clone(), 0));
+    });
+
+    let receipts = f.client.receipts_of_provider(&provider, &0u32, &10u32);
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts.get(0).unwrap().voucher_id, 2);
+}
+
+#[test]
 fn missing_receipt_errors() {
     let f = setup();
     let err = f.client.try_get_receipt(&404u64).err().unwrap().unwrap();
@@ -232,11 +338,16 @@ fn no_transfer_entry_points() {
 }
 
 #[test]
-fn admin_can_repoint_minter() {
+fn minter_handover_takes_two_steps() {
     let f = setup();
     let new_minter = Address::generate(&f.env);
-    f.client.set_minter(&f.admin, &new_minter);
+    f.client.propose_minter(&f.admin, &new_minter);
+    assert_eq!(f.client.get_minter(), f.minter);
+    assert_eq!(f.client.get_pending_minter(), Some(new_minter.clone()));
+
+    f.client.accept_minter(&new_minter);
     assert_eq!(f.client.get_minter(), new_minter);
+    assert_eq!(f.client.get_pending_minter(), None);
 
     // Old minter loses the right to mint.
     let provider = Address::generate(&f.env);
@@ -257,16 +368,40 @@ fn admin_can_repoint_minter() {
 }
 
 #[test]
-fn non_admin_cannot_repoint_minter() {
+fn non_admin_cannot_propose_minter() {
     let f = setup();
     let impostor = Address::generate(&f.env);
     let err = f
         .client
-        .try_set_minter(&impostor, &impostor)
+        .try_propose_minter(&impostor, &impostor)
         .err()
         .unwrap()
         .unwrap();
     assert_eq!(err, ReceiptError::NotAuthorized);
+}
+
+#[test]
+fn only_the_nominee_can_accept_minter() {
+    let f = setup();
+    let nominee = Address::generate(&f.env);
+
+    // Nothing proposed yet.
+    let err = f.client.try_accept_minter(&nominee).err().unwrap().unwrap();
+    assert_eq!(err, ReceiptError::NoPendingMinter);
+
+    f.client.propose_minter(&f.admin, &nominee);
+    let intruder = Address::generate(&f.env);
+    let err = f
+        .client
+        .try_accept_minter(&intruder)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, ReceiptError::NotAuthorized);
+
+    // The failed acceptance did not consume the nomination.
+    f.client.accept_minter(&nominee);
+    assert_eq!(f.client.get_minter(), nominee);
 }
 
 #[test]
@@ -280,10 +415,10 @@ fn admin_handover_takes_two_steps() {
     assert_eq!(f.client.get_admin(), new_admin);
     assert_eq!(f.client.get_pending_admin(), None);
 
-    // The old admin can no longer repoint the minter.
+    // The old admin can no longer propose a minter.
     let err = f
         .client
-        .try_set_minter(&f.admin, &new_admin)
+        .try_propose_minter(&f.admin, &new_admin)
         .err()
         .unwrap()
         .unwrap();
@@ -339,13 +474,20 @@ struct AuthFixture {
     f: Fixture,
     /// Never used as admin: the nominee for the `accept_admin` row.
     new_admin: Address,
+    /// Never used as minter: the nominee for the `accept_minter` row.
+    new_minter: Address,
 }
 
 impl AuthFixture {
     fn new() -> Self {
         let f = setup();
         let new_admin = Address::generate(&f.env);
-        Self { f, new_admin }
+        let new_minter = Address::generate(&f.env);
+        Self {
+            f,
+            new_admin,
+            new_minter,
+        }
     }
 }
 
@@ -394,6 +536,10 @@ fn new_admin_addr(f: &AuthFixture) -> Address {
     f.new_admin.clone()
 }
 
+fn new_minter_addr(f: &AuthFixture) -> Address {
+    f.new_minter.clone()
+}
+
 /// Every public function of the receipt book, in declaration order.
 const AUTH_MATRIX: &[AuthCase] = &[
     AuthCase {
@@ -401,8 +547,12 @@ const AUTH_MATRIX: &[AuthCase] = &[
         auth: Auth::Free("none (one-shot)"),
     },
     AuthCase {
-        function: "set_minter",
+        function: "propose_minter",
         auth: signer("`admin`", admin_addr),
+    },
+    AuthCase {
+        function: "accept_minter",
+        auth: signer("`new_minter`", new_minter_addr),
     },
     AuthCase {
         function: "mint",
@@ -421,11 +571,19 @@ const AUTH_MATRIX: &[AuthCase] = &[
         auth: Auth::Free("none (view)"),
     },
     AuthCase {
+        function: "get_pending_minter",
+        auth: Auth::Free("none (view)"),
+    },
+    AuthCase {
         function: "get_receipt",
         auth: Auth::Free("none (view)"),
     },
     AuthCase {
         function: "count_for",
+        auth: Auth::Free("none (view)"),
+    },
+    AuthCase {
+        function: "receipts_of_provider",
         auth: Auth::Free("none (view)"),
     },
     AuthCase {
@@ -491,8 +649,12 @@ fn run_case(f: &AuthFixture, function: &str) -> std::vec::Vec<Address> {
             ReceiptBookClient::new(&env, &address).initialize(&a, &a);
             return recorded_auths(&env);
         }
-        "set_minter" => {
-            client.set_minter(&f.f.admin, &Address::generate(env));
+        "propose_minter" => {
+            client.propose_minter(&f.f.admin, &f.new_minter);
+        }
+        "accept_minter" => {
+            client.propose_minter(&f.f.admin, &f.new_minter);
+            client.accept_minter(&f.new_minter);
         }
         "mint" => {
             mint_one(&f.f);
@@ -507,12 +669,18 @@ fn run_case(f: &AuthFixture, function: &str) -> std::vec::Vec<Address> {
         "get_pending_admin" => {
             client.get_pending_admin();
         }
+        "get_pending_minter" => {
+            client.get_pending_minter();
+        }
         "get_receipt" => {
             mint_one(&f.f);
             client.get_receipt(&1u64);
         }
         "count_for" => {
             client.count_for(&bref(env, 7));
+        }
+        "receipts_of_provider" => {
+            client.receipts_of_provider(&f.f.minter, &0u32, &10u32);
         }
         "name" => {
             client.name();
@@ -791,11 +959,29 @@ fn initialized_event_snapshot() {
 }
 
 #[test]
+fn minter_proposed_event_snapshot() {
+    let f = setup();
+    let new_minter = Address::generate(&f.env);
+
+    f.client.propose_minter(&f.admin, &new_minter);
+
+    let e = one_event(&f.env, &f.client.address);
+    assert_layout(
+        &e,
+        "minter_proposed",
+        &[ScVal::from(&f.admin)],
+        &["pending_minter"],
+    );
+    assert_eq!(field_address(&f.env, &e, "pending_minter"), new_minter);
+}
+
+#[test]
 fn minter_changed_event_snapshot() {
     let f = setup();
     let new_minter = Address::generate(&f.env);
 
-    f.client.set_minter(&f.admin, &new_minter);
+    f.client.propose_minter(&f.admin, &new_minter);
+    f.client.accept_minter(&new_minter);
 
     let e = one_event(&f.env, &f.client.address);
     // `minter` is data, not a topic: an indexer reading it from the topic list
@@ -892,6 +1078,20 @@ fn count_ttl(f: &Fixture, beneficiary: &BytesN<32>) -> u32 {
         .as_contract(&contract, || f.env.storage().persistent().get_ttl(&key))
 }
 
+fn provider_count_ttl(f: &Fixture, provider: &Address) -> u32 {
+    let contract = f.client.address.clone();
+    let key = DataKey::ProviderCount(provider.clone());
+    f.env
+        .as_contract(&contract, || f.env.storage().persistent().get_ttl(&key))
+}
+
+fn provider_entry_ttl(f: &Fixture, provider: &Address, index: u32) -> u32 {
+    let contract = f.client.address.clone();
+    let key = DataKey::ProviderReceipt(provider.clone(), index);
+    f.env
+        .as_contract(&contract, || f.env.storage().persistent().get_ttl(&key))
+}
+
 #[test]
 fn receipt_survives_sixty_days_of_activity() {
     let f = setup();
@@ -954,4 +1154,21 @@ fn count_for_extends_its_own_entry() {
     // And an unknown beneficiary is still an ordinary zero, not an error.
     advance_days(&f, 30);
     assert_eq!(f.client.count_for(&bref(&f.env, 9)), 0);
+}
+
+#[test]
+fn provider_index_extends_its_own_entries() {
+    let f = setup();
+    let provider = Address::generate(&f.env);
+    let patient = bref(&f.env, 7);
+    f.client
+        .mint(&f.minter, &1u64, &patient, &provider, &101u32, &30_000_000);
+
+    // Day 61: the index entries are past their 30-day threshold. Only a
+    // read through `receipts_of_provider` extends them.
+    advance_days(&f, 61);
+    let receipts = f.client.receipts_of_provider(&provider, &0u32, &10u32);
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(provider_count_ttl(&f, &provider), NINETY_DAYS);
+    assert_eq!(provider_entry_ttl(&f, &provider, 0), NINETY_DAYS);
 }

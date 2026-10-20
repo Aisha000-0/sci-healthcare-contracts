@@ -9,6 +9,8 @@ Three contracts. `registry` and `receipt` hold no references and deploy first; `
 
 All amounts are `i128` in the token's smallest unit. All timestamps are `u64` seconds since epoch.
 
+`contracts/common` (`sci-common`) is an internal `rlib` shared by the three contracts: the TTL constants, the persistent-entry extension helper and the two-step admin handover (`propose_admin` / `take_pending_admin` / `require_admin`). It defines no contract entry points; each contract keeps its own `DataKey`, errors and events, so the public interface and the numbers callers see are unchanged. Faucet keeps its own shorter drip TTLs.
+
 Protocol terminology used across the docs is defined in [docs/glossary.md](../glossary.md). Clinic questions (payment timing, disputes, fees) are answered in [docs/guides/clinics-faq.md](../guides/clinics-faq.md), and French versions of the funder, clinic and attester guides live under [docs/fr/](../fr/).
 
 ---
@@ -300,20 +302,27 @@ pub struct Receipt {
 | Function | Parameters | Returns | Auth |
 | --- | --- | --- | --- |
 | `initialize` | `admin, minter` | `()` | once |
-| `set_minter` | `admin, minter` | `()` | `admin` |
+| `propose_minter` | `admin, new_minter` | `()` | `admin` |
+| `accept_minter` | `new_minter` | `()` | `new_minter` |
 | `mint` | `minter, voucher_id, beneficiary_ref, provider, service_code, amount` | `()` | `minter` |
 | `get_receipt` | `voucher_id` | `Receipt` | view |
 | `count_for` | `beneficiary_ref` | `u32` | view |
+| `receipts_of_provider` | `provider, start, limit` | `Vec<Receipt>` | view |
 | `name` | — | `String` | none (view) |
 | `symbol` | — | `String` | none (view) |
 | `receipt_uri` | `voucher_id` | `String` | none (view) |
 | `get_minter` | — | `Address` | view |
+| `get_pending_minter` | — | `Option<Address>` | view |
 | `get_admin` | — | `Address` | view |
 | `version` | — | `String` | view |
 
-Only the minter — the voucher contract — may mint. Because the voucher contract does not exist when the receipt book is initialised, deploy order is: receipt, voucher, then `set_minter`.
+Only the minter — the voucher contract — may mint. Contract instances are deployed before either is initialised, so the receipt book can name the voucher contract as minter in `initialize`. Changing the minter later is a two-step handover: `propose_minter` then `accept_minter`.
+
+Both the admin and the minter are handed over in two steps. `propose_minter(admin, new_minter)` only records a nomination and emits `minter_proposed`; `accept_minter(new_minter)` is what changes `get_minter()`. A typo in the proposed address therefore cannot hand minting rights to the wrong contract, and cannot stop receipts, because the old minter keeps working until the nominee accepts. `get_pending_minter()` shows an outstanding nomination.
 
 Receipts are soulbound: there is deliberately no transfer function, so a receipt stays bound to the beneficiary reference it was minted against. `name`, `symbol` and `receipt_uri` are read-only wallet metadata. `receipt_uri(voucher_id)` returns `https://receipts.sci.health/v1/receipt/<voucher_id>` — the voucher id only, no patient or beneficiary data — so explorers can display the receipt without exposing any PHI.
+
+`mint` also appends the voucher id to a per-provider index, so a clinic can prove its track record to a funder or auditor without an indexer. `receipts_of_provider(provider, start, limit)` returns that clinic's receipts in mint order, newest last. `limit` is capped at `MAX_RECEIPTS_PAGE` (50); page with `start += returned.len()`. The index is keyed by provider address, so two clinics' receipts never mix, and a provider with no receipts gets an empty vector rather than an error.
 
 ### Authorisation matrix
 
@@ -322,13 +331,16 @@ Every public function, with the exact signer it demands. `AUTH_MATRIX` in `contr
 | Function | Signer required |
 | --- | --- |
 | `initialize` | none (one-shot) |
-| `set_minter` | `admin` |
+| `propose_minter` | `admin` |
+| `accept_minter` | `new_minter` |
 | `mint` | `minter` |
 | `propose_admin` | `admin` |
 | `accept_admin` | `new_admin` |
 | `get_pending_admin` | none (view) |
+| `get_pending_minter` | none (view) |
 | `get_receipt` | none (view) |
 | `count_for` | none (view) |
+| `receipts_of_provider` | none (view) |
 | `name` | none (view) |
 | `symbol` | none (view) |
 | `receipt_uri` | none (view) |
@@ -347,10 +359,13 @@ Every public function, with the exact signer it demands. `AUTH_MATRIX` in `contr
 | 5 | `ReceiptExists` |
 | 6 | `InvalidAmount` |
 | 7 | `NoPendingAdmin` |
+| 8 | `NoPendingMinter` |
 
 ### Events
 
 `receipt_minted` — topics `beneficiary_ref`, `provider`; data `voucher_id`, `service_code`, `amount`, `settled_at`
+
+`minter_proposed` — topic `admin`; data `pending_minter`. `minter_changed` — data `minter`. The indexer should treat `minter_proposed` as a pending state only: `get_minter()` changes on `minter_changed`, after the nominee accepts.
 
 ## faucet (testnet only)
 
@@ -410,6 +425,7 @@ stays in the live ledger. These are the numbers, all in ledgers:
 | `Voucher(id)` | persistent | every read and write | 30 days | 90 days |
 | `Provider`, `Service`, `Attester` | persistent | every read and write | 30 days | 90 days |
 | `Receipt(id)`, `Count(beneficiary_ref)` | persistent | every read and write | 30 days | 90 days |
+| `ProviderCount(provider)`, `ProviderReceipt(provider, index)` | persistent | every mint and `receipts_of_provider` read | 30 days | 90 days |
 | Faucet `LastDrip(address)` | temporary | every drip | 1 day | 7 days |
 
 "Extended when" is a threshold, not a refresh on every call: the TTL is only

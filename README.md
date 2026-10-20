@@ -248,9 +248,11 @@ deployed contract.
 | Function | Auth | Purpose |
 | --- | --- | --- |
 | `initialize(admin, minter)` | once | Sets admin and minter |
-| `set_minter(admin, minter)` | admin | Repoints at a redeployed voucher contract |
+| `propose_minter(admin, new_minter)` | admin | Nominates a new voucher contract |
+| `accept_minter(new_minter)` | new_minter | Completes the handover |
 | `mint(minter, voucher_id, beneficiary_ref, provider, service_code, amount)` | minter | Records a settled episode |
 | `count_for(beneficiary_ref)` | view | Settled episodes for a beneficiary |
+| `receipts_of_provider(provider, start, limit)` | view | A clinic's receipts in mint order, capped at 50 per page |
 
 There is deliberately no transfer function on receipts.
 

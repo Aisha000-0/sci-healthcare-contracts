@@ -504,8 +504,8 @@ const count = await read(contracts.receipt, 'count_for', [
 console.log('settled episodes', Number(count));
 ```
 
-The contract stores receipts by voucher id and exposes `count_for(ref)`, not a
-list. For a full history, query the read-only indexer:
+The contract stores receipts by voucher id and exposes `count_for(ref)` for a
+beneficiary's total. For a full patient history, query the read-only indexer:
 
 ```js
 const refHex = beneficiaryRef.toString('hex');
@@ -516,6 +516,22 @@ if (!response.ok) throw new Error(`Receipt history failed: ${response.status}`);
 const history = await response.json();
 console.log(history.receipts);
 ```
+
+A clinic can read its own on-chain history without the indexer. The receipt
+book keeps a per-provider index in mint order:
+
+```js
+// At most 50 per page; pass start = receipts.length for the next page.
+const receipts = await read(contracts.receipt, 'receipts_of_provider', [
+  arg.address(provider),
+  arg.u32(0),
+  arg.u32(50),
+]);
+console.log(receipts.map((r) => String(r.voucher_id)));
+```
+
+Two clinics' indexes are separate, so this list never includes another
+clinic's receipts.
 
 The indexer holds only public on-chain data and needs the same 64-character
 reference. It cannot enumerate patients without the key.

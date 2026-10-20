@@ -112,3 +112,14 @@ pub enum VoucherError {
     /// The attestation cap must be at least 1.
     InvalidAttestationCap = 20,
 }
+
+/// Maps the shared helpers' failures onto this contract's error numbers, so
+/// callers keep seeing the same codes they did before the helpers were shared.
+impl From<sci_common::CommonError> for VoucherError {
+    fn from(error: sci_common::CommonError) -> Self {
+        match error {
+            sci_common::CommonError::NotAuthorized => VoucherError::NotAuthorized,
+            sci_common::CommonError::NoPendingAdmin => VoucherError::NoPendingAdmin,
+        }
+    }
+}

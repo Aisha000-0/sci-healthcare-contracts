@@ -161,11 +161,12 @@ say "Initializing registry"
 run stellar contract invoke --id "$REGISTRY_ID" --source-account "$ADMIN" \
   --network "$NETWORK" -- initialize --admin "$ADMIN_ADDR"
 
-# The receipt book needs a minter at init but the voucher contract does not
-# exist yet at that point, so the admin stands in and is repointed below.
+# The receipt book is initialised after both contracts exist, so it can name
+# the voucher contract as minter at once. Changing the minter later is a
+# two-step handover (`propose_minter` / `accept_minter`).
 say "Initializing receipt book"
 run stellar contract invoke --id "$RECEIPT_ID" --source-account "$ADMIN" \
-  --network "$NETWORK" -- initialize --admin "$ADMIN_ADDR" --minter "$ADMIN_ADDR"
+  --network "$NETWORK" -- initialize --admin "$ADMIN_ADDR" --minter "$VOUCHER_ID"
 
 say "Initializing voucher escrow"
 run stellar contract invoke --id "$VOUCHER_ID" --source-account "$ADMIN" \
@@ -177,10 +178,6 @@ run stellar contract invoke --id "$VOUCHER_ID" --source-account "$ADMIN" \
   --dispute_window "$DISPUTE_WINDOW" \
   --fee_bps "$FEE_BPS" \
   --fee_account "$ADMIN_ADDR"
-
-say "Pointing receipt book at the voucher contract"
-run stellar contract invoke --id "$RECEIPT_ID" --source-account "$ADMIN" \
-  --network "$NETWORK" -- set_minter --admin "$ADMIN_ADDR" --minter "$VOUCHER_ID"
 
 if [ "$DRY_RUN" -eq 1 ]; then
   printf '+ cat > %q <<ENVEOF\n' "$OUT"

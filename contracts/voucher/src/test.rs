@@ -54,13 +54,17 @@ fn setup() -> Fixture {
     let registry = RegistryClient::new(&env, &registry_addr);
     registry.initialize(&admin);
 
-    let receipt_addr = env.register(ReceiptBook, ());
-    let receipts = ReceiptBookClient::new(&env, &receipt_addr);
-    // Minter is repointed at the voucher contract below.
-    receipts.initialize(&admin, &admin);
-
+    // Both instances exist before either is initialised, so the receipt book
+    // can name the voucher contract as minter at once — the same order
+    // scripts/deploy.sh uses. The two-step handover is covered on its own in
+    // the receipt tests and in multisig_admin_can_act_on_all_three_contracts.
     let voucher_addr = env.register(VoucherEscrow, ());
     let voucher = VoucherEscrowClient::new(&env, &voucher_addr);
+
+    let receipt_addr = env.register(ReceiptBook, ());
+    let receipts = ReceiptBookClient::new(&env, &receipt_addr);
+    receipts.initialize(&admin, &voucher_addr);
+
     voucher.initialize(
         &admin,
         &registry_addr,
@@ -70,7 +74,6 @@ fn setup() -> Fixture {
         &FEE_BPS,
         &fee_account,
     );
-    receipts.set_minter(&admin, &voucher_addr);
 
     // An active provider with one priced service, and one attester.
     registry.register_provider(
@@ -370,6 +373,100 @@ fn quote_matches_settlement() {
 
     assert_eq!(f.token.balance(&f.provider), net);
     assert_eq!(f.token.balance(&f.fee_account), fee);
+}
+
+#[test]
+fn quote_equals_settlement_for_every_amount() {
+    // The app shows `quote` before the funder signs. If settlement paid
+    // anything other than that, the funder would be misled at the moment
+    // they commit money. Cover amounts below one fee unit (where integer
+    // division rounds the fee down), amounts that land exactly on a unit,
+    // ordinary prices, and the largest amount the fixture can fund.
+    const CHEAP: u32 = 202;
+    const CHEAP_PRICE: i128 = 1;
+    // The funder starts with 1_000_000_000 units, so this is the maximum
+    // amount a single voucher can carry in this fixture.
+    const MAX_AMOUNT: i128 = 1_000_000_000;
+
+    let amounts = [
+        1i128,
+        2,
+        3,
+        99,
+        100,
+        101,
+        199,
+        999,
+        10_000,
+        30_000_000,
+        999_999_999,
+        MAX_AMOUNT,
+    ];
+
+    for amount in amounts {
+        let f = setup();
+        f.registry.upsert_service(
+            &f.provider,
+            &CHEAP,
+            &String::from_str(&f.env, "Cheap service"),
+            &CHEAP_PRICE,
+        );
+
+        let (fee, net) = f.voucher.quote(&amount);
+        assert_eq!(fee + net, amount, "quote does not add up for {amount}");
+        assert_eq!(
+            fee,
+            amount * FEE_BPS as i128 / 10_000,
+            "fee is not the documented basis-point cut for {amount}"
+        );
+        assert_eq!(
+            net,
+            amount - fee,
+            "net is not amount minus fee for {amount}"
+        );
+
+        let funder_before = f.token.balance(&f.funder);
+        let id = f.voucher.create_voucher(
+            &f.funder,
+            &patient(&f.env),
+            &f.provider,
+            &CHEAP,
+            &amount,
+            &(START_TIME + 30 * 24 * 60 * 60),
+        );
+        f.voucher.claim(&f.provider, &id);
+        f.voucher.attest(&f.attester, &id);
+        advance(&f.env, DISPUTE_WINDOW + 1);
+        f.voucher.settle(&id);
+
+        assert_eq!(
+            f.token.balance(&f.funder),
+            funder_before - amount,
+            "funder paid a different amount than quoted for {amount}"
+        );
+        assert_eq!(
+            f.token.balance(&f.provider),
+            net,
+            "provider received a different net than quoted for {amount}"
+        );
+        assert_eq!(
+            f.token.balance(&f.fee_account),
+            fee,
+            "fee account received a different fee than quoted for {amount}"
+        );
+        assert_eq!(
+            f.token.balance(&f.voucher.address),
+            0,
+            "escrow kept funds after settlement for {amount}"
+        );
+    }
+}
+
+#[test]
+fn quote_rejects_an_amount_whose_fee_overflows() {
+    let f = setup();
+    let err = f.voucher.try_quote(&i128::MAX).err().unwrap().unwrap();
+    assert_eq!(err, VoucherError::MathOverflow);
 }
 
 #[test]
@@ -1068,11 +1165,14 @@ fn multisig_admin_can_act_on_all_three_contracts() {
     f.registry
         .set_provider_status(&multisig, &f.provider, &ProviderStatus::Active);
 
-    // Receipt book: repoint the minter, then put it back for the voucher.
+    // Receipt book: hand the minter role over in two steps, then put it
+    // back for the voucher.
     let new_minter = Address::generate(&f.env);
-    f.receipts.set_minter(&multisig, &new_minter);
+    f.receipts.propose_minter(&multisig, &new_minter);
+    f.receipts.accept_minter(&new_minter);
     assert_eq!(f.receipts.get_minter(), new_minter);
-    f.receipts.set_minter(&multisig, &f.voucher.address);
+    f.receipts.propose_minter(&multisig, &f.voucher.address);
+    f.receipts.accept_minter(&f.voucher.address);
 
     // Voucher: resolve a real dispute as the multisig admin.
     let id = fund(&f);

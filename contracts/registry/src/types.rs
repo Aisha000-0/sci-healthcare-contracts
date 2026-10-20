@@ -98,3 +98,14 @@ pub enum RegistryError {
     /// go through `schedule_service_price`.
     PriceIncreaseNeedsNotice = 13,
 }
+
+/// Maps the shared helpers' failures onto this contract's error numbers, so
+/// callers keep seeing the same codes they did before the helpers were shared.
+impl From<sci_common::CommonError> for RegistryError {
+    fn from(error: sci_common::CommonError) -> Self {
+        match error {
+            sci_common::CommonError::NotAuthorized => RegistryError::NotAuthorized,
+            sci_common::CommonError::NoPendingAdmin => RegistryError::NoPendingAdmin,
+        }
+    }
+}

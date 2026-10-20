@@ -10,6 +10,7 @@ crate-type = ["cdylib", "rlib"]
 doctest = false
 
 [dependencies]
+sci-common = { workspace = true }
 soroban-sdk = { workspace = true }
 
 [dev-dependencies]

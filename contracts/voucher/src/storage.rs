@@ -1,22 +1,12 @@
+use sci_common as common;
 use soroban_sdk::{Address, Env};
 
 use crate::DEFAULT_MAX_ATTESTATIONS_PER_DAY;
 
 use crate::types::{Config, DataKey, Voucher, VoucherError};
 
-const DAY_IN_LEDGERS: u32 = 17_280;
-const INSTANCE_TTL_THRESHOLD: u32 = 7 * DAY_IN_LEDGERS;
-const INSTANCE_TTL_EXTEND: u32 = 30 * DAY_IN_LEDGERS;
-const PERSISTENT_TTL_THRESHOLD: u32 = 30 * DAY_IN_LEDGERS;
-const PERSISTENT_TTL_EXTEND: u32 = 90 * DAY_IN_LEDGERS;
-/// An attestation counter is only read on the day it counts; two days of
-/// ledgers covers that day whatever the hour it was first written.
-const ATTESTATIONS_TTL: u32 = 2 * DAY_IN_LEDGERS;
-
 pub(crate) fn extend_instance(env: &Env) {
-    env.storage()
-        .instance()
-        .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
+    common::extend_instance(env);
 }
 
 pub(crate) fn has_config(env: &Env) -> bool {
@@ -52,9 +42,7 @@ pub(crate) fn read_voucher(env: &Env, id: u64) -> Result<Voucher, VoucherError> 
         .persistent()
         .get(&key)
         .ok_or(VoucherError::VoucherNotFound)?;
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+    common::extend_persistent(env, &key);
     Ok(voucher)
 }
 
@@ -66,24 +54,8 @@ pub(crate) fn read_voucher(env: &Env, id: u64) -> Result<Voucher, VoucherError> 
 pub(crate) fn write_voucher(env: &Env, voucher: &Voucher) {
     let key = DataKey::Voucher(voucher.id);
     env.storage().persistent().set(&key, voucher);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+    common::extend_persistent(env, &key);
     extend_instance(env);
-}
-
-pub(crate) fn read_pending_admin(env: &Env) -> Option<Address> {
-    env.storage().instance().get(&DataKey::PendingAdmin)
-}
-
-pub(crate) fn write_pending_admin(env: &Env, pending: &Address) {
-    env.storage()
-        .instance()
-        .set(&DataKey::PendingAdmin, pending);
-}
-
-pub(crate) fn clear_pending_admin(env: &Env) {
-    env.storage().instance().remove(&DataKey::PendingAdmin);
 }
 
 pub(crate) fn read_attestation_cap(env: &Env) -> u32 {
@@ -110,5 +82,5 @@ pub(crate) fn write_attestations(env: &Env, attester: &Address, day: u64, count:
     env.storage().temporary().set(&key, &count);
     env.storage()
         .temporary()
-        .extend_ttl(&key, ATTESTATIONS_TTL, ATTESTATIONS_TTL);
+        .extend_ttl(&key, common::ATTESTATIONS_TTL, common::ATTESTATIONS_TTL);
 }
