@@ -212,14 +212,18 @@ deployed contract.
 | `initialize(admin)` | once | Sets the administrator |
 | `register_provider(owner, name, country)` | owner | Self-registers a clinic as `Pending` |
 | `set_provider_status(admin, provider, status)` | admin | `Pending` → `Active` → `Suspended` |
-| `upsert_service(provider, code, label, price)` | provider | Lists a billable service; requires `Active` |
+| `upsert_service(provider, code, label, price)` | provider | Lists a billable service or lowers its price; requires `Active` |
+| `schedule_service_price(provider, code, price, effective_at)` | provider | Schedules a price change at least 24 h ahead |
 | `remove_service(provider, code)` | provider | Delists a service |
+| `set_service_available(provider, code, available)` | provider | Pauses or resumes a service without delisting it |
 | `add_attester(admin, attester)` | admin | Grants attester rights |
 | `remove_attester(admin, attester)` | admin | Revokes them |
 | `propose_admin(admin, new_admin)` | admin | Nominates a new admin |
 | `accept_admin(new_admin)` | nominee | Completes the two-step handover |
 | `is_active_provider(provider)` | view | The check `voucher` relies on |
 | `get_service_price(provider, code)` | view | Price, or 0 if absent/inactive |
+| `is_service_available(provider, code)` | view | Listed, active and not paused |
+| `get_upcoming_price(provider, code)` | view | Scheduled price and when it applies, or `(0, 0)` |
 | `is_attester(addr)` | view | Attester check |
 
 ### `voucher`
@@ -233,6 +237,7 @@ deployed contract.
 | `dispute(funder, voucher_id, reason_code)` | funder | Contests before the window closes |
 | `settle(voucher_id)` | none | Releases escrow once the window closes |
 | `refund(voucher_id)` | none | Returns escrow after an unclaimed voucher expires, or 7 days after expiry if claimed but never attested |
+| `set_attestation_cap(admin, cap)` | admin | Caps attestations per attester per UTC day (default 100) |
 | `refundable_at(voucher_id)` | view | When `refund` will succeed |
 | `propose_admin` / `accept_admin` | admin / nominee | Two-step admin handover |
 | `resolve_dispute(admin, voucher_id, refund_funder)` | admin | Routes escrow to one of the two parties |

@@ -5,7 +5,7 @@ use soroban_sdk::{
     Address, Env, String, Vec,
 };
 
-use crate::{ProviderStatus, Registry, RegistryClient, RegistryError};
+use crate::{ProviderStatus, Registry, RegistryClient, RegistryError, MIN_PRICE_NOTICE_SECS};
 
 struct Fixture {
     env: Env,
@@ -47,6 +47,15 @@ fn register_active_provider(f: &Fixture) -> Address {
 fn initialize_sets_admin() {
     let f = setup();
     assert_eq!(f.client.get_admin(), f.admin);
+}
+
+#[test]
+fn version_is_the_crate_version() {
+    let f = setup();
+    let version = f.client.version();
+    assert_eq!(version, String::from_str(&f.env, env!("CARGO_PKG_VERSION")));
+    // Every contract shares the workspace version.
+    assert_eq!(version, String::from_str(&f.env, "0.2.0"));
 }
 
 #[test]
@@ -181,20 +190,189 @@ fn active_provider_manages_catalog() {
 }
 
 #[test]
-fn upsert_overwrites_price() {
+fn upsert_lowers_price_immediately() {
     let f = setup();
     let provider = register_active_provider(&f);
     let label = String::from_str(&f.env, "Malaria RDT");
 
     f.client
-        .upsert_service(&provider, &202u32, &label, &10_000_000i128);
-    f.client
         .upsert_service(&provider, &202u32, &label, &12_500_000i128);
+    f.client
+        .upsert_service(&provider, &202u32, &label, &10_000_000i128);
 
     assert_eq!(
         f.client.get_service(&provider, &202u32).price,
-        12_500_000i128
+        10_000_000i128
     );
+}
+
+#[test]
+fn upsert_cannot_raise_price_without_notice() {
+    let f = setup();
+    let provider = register_active_provider(&f);
+    let label = String::from_str(&f.env, "Malaria RDT");
+    f.client
+        .upsert_service(&provider, &202u32, &label, &10_000_000i128);
+
+    let err = f
+        .client
+        .try_upsert_service(&provider, &202u32, &label, &12_500_000i128)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, RegistryError::PriceIncreaseNeedsNotice);
+    assert_eq!(f.client.get_service_price(&provider, &202u32), 10_000_000);
+}
+
+/// Lists one service at `PRICE` at a provider and starts the clock at
+/// `START`, so schedules can be expressed relative to it.
+fn priced_service(f: &Fixture) -> Address {
+    f.env.ledger().with_mut(|li| li.timestamp = START);
+    let provider = register_active_provider(f);
+    f.client.upsert_service(
+        &provider,
+        &CONSULT,
+        &String::from_str(&f.env, "Outpatient consult"),
+        &PRICE,
+    );
+    provider
+}
+
+const START: u64 = 1_700_000_000;
+
+#[test]
+fn scheduled_price_applies_at_the_effective_time() {
+    let f = setup();
+    let provider = priced_service(&f);
+    let effective_at = START + MIN_PRICE_NOTICE_SECS;
+
+    f.client
+        .schedule_service_price(&provider, &CONSULT, &(PRICE * 2), &effective_at);
+
+    // Before: the current price stands and the upcoming one is visible.
+    assert_eq!(f.client.get_service_price(&provider, &CONSULT), PRICE);
+    assert_eq!(
+        f.client.get_upcoming_price(&provider, &CONSULT),
+        (PRICE * 2, effective_at)
+    );
+    f.env
+        .ledger()
+        .with_mut(|li| li.timestamp = effective_at - 1);
+    assert_eq!(f.client.get_service_price(&provider, &CONSULT), PRICE);
+
+    // At the effective time it applies, with nobody calling in.
+    f.env.ledger().with_mut(|li| li.timestamp = effective_at);
+    assert_eq!(f.client.get_service_price(&provider, &CONSULT), PRICE * 2);
+    assert_eq!(f.client.get_service(&provider, &CONSULT).price, PRICE * 2);
+    assert_eq!(f.client.get_upcoming_price(&provider, &CONSULT), (0, 0));
+    let codes = Vec::from_array(&f.env, [CONSULT]);
+    assert_eq!(
+        f.client
+            .get_services(&provider, &codes)
+            .get_unchecked(0)
+            .price,
+        PRICE * 2
+    );
+}
+
+#[test]
+fn scheduled_price_needs_the_minimum_notice() {
+    let f = setup();
+    let provider = priced_service(&f);
+
+    for effective_at in [START, START + MIN_PRICE_NOTICE_SECS - 1] {
+        let err = f
+            .client
+            .try_schedule_service_price(&provider, &CONSULT, &(PRICE * 2), &effective_at)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, RegistryError::PriceNoticeTooShort);
+    }
+    assert_eq!(f.client.get_upcoming_price(&provider, &CONSULT), (0, 0));
+}
+
+#[test]
+fn rescheduling_replaces_the_earlier_schedule() {
+    let f = setup();
+    let provider = priced_service(&f);
+    let first = START + MIN_PRICE_NOTICE_SECS;
+    let second = START + 2 * MIN_PRICE_NOTICE_SECS;
+
+    f.client
+        .schedule_service_price(&provider, &CONSULT, &(PRICE * 2), &first);
+    // Scheduling the current price is how a clinic calls a change off.
+    f.client
+        .schedule_service_price(&provider, &CONSULT, &PRICE, &second);
+
+    f.env.ledger().with_mut(|li| li.timestamp = first);
+    assert_eq!(f.client.get_service_price(&provider, &CONSULT), PRICE);
+    assert_eq!(
+        f.client.get_upcoming_price(&provider, &CONSULT),
+        (PRICE, second)
+    );
+}
+
+#[test]
+fn upsert_keeps_a_scheduled_price() {
+    let f = setup();
+    let provider = priced_service(&f);
+    let effective_at = START + MIN_PRICE_NOTICE_SECS;
+    f.client
+        .schedule_service_price(&provider, &CONSULT, &(PRICE * 2), &effective_at);
+
+    f.client.upsert_service(
+        &provider,
+        &CONSULT,
+        &String::from_str(&f.env, "Consult (renamed)"),
+        &PRICE,
+    );
+
+    assert_eq!(
+        f.client.get_upcoming_price(&provider, &CONSULT),
+        (PRICE * 2, effective_at)
+    );
+}
+
+#[test]
+fn schedule_rejects_bad_input() {
+    let f = setup();
+    let provider = priced_service(&f);
+    let effective_at = START + MIN_PRICE_NOTICE_SECS;
+
+    let err = f
+        .client
+        .try_schedule_service_price(&provider, &CONSULT, &0i128, &effective_at)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, RegistryError::InvalidPrice);
+
+    let err = f
+        .client
+        .try_schedule_service_price(&provider, &999u32, &PRICE, &effective_at)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, RegistryError::ServiceNotFound);
+
+    let err = f
+        .client
+        .try_get_upcoming_price(&provider, &999u32)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, RegistryError::ServiceNotFound);
+
+    f.client
+        .set_provider_status(&f.admin, &provider, &ProviderStatus::Suspended);
+    let err = f
+        .client
+        .try_schedule_service_price(&provider, &CONSULT, &PRICE, &effective_at)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, RegistryError::ProviderNotActive);
 }
 
 #[test]
@@ -319,6 +497,79 @@ fn get_services_batches_and_skips_missing() {
     let codes = Vec::from_array(&f.env, [101u32, 202u32, 999u32]);
     let items = f.client.get_services(&provider, &codes);
     assert_eq!(items.len(), 2);
+}
+
+#[test]
+fn new_service_is_available() {
+    let f = setup();
+    let provider = register_active_provider(&f);
+    f.client.upsert_service(
+        &provider,
+        &202u32,
+        &String::from_str(&f.env, "Malaria RDT"),
+        &10_000_000i128,
+    );
+
+    assert!(f.client.get_service(&provider, &202u32).available);
+    assert!(f.client.is_service_available(&provider, &202u32));
+}
+
+#[test]
+fn paused_service_stays_listed_and_priced() {
+    let f = setup();
+    let provider = register_active_provider(&f);
+    f.client.upsert_service(
+        &provider,
+        &202u32,
+        &String::from_str(&f.env, "Malaria RDT"),
+        &10_000_000i128,
+    );
+
+    f.client.set_service_available(&provider, &202u32, &false);
+
+    let item = f.client.get_service(&provider, &202u32);
+    assert!(!item.available);
+    assert!(item.active);
+    assert!(!f.client.is_service_available(&provider, &202u32));
+    // Still priced, so `voucher` can say "unavailable" rather than "not offered".
+    assert_eq!(
+        f.client.get_service_price(&provider, &202u32),
+        10_000_000i128
+    );
+    let codes = Vec::from_array(&f.env, [202u32]);
+    assert_eq!(f.client.get_services(&provider, &codes).len(), 1);
+
+    f.client.set_service_available(&provider, &202u32, &true);
+    assert!(f.client.is_service_available(&provider, &202u32));
+}
+
+#[test]
+fn repricing_a_paused_service_keeps_it_paused() {
+    let f = setup();
+    let provider = register_active_provider(&f);
+    let label = String::from_str(&f.env, "Malaria RDT");
+    f.client
+        .upsert_service(&provider, &202u32, &label, &10_000_000i128);
+    f.client.set_service_available(&provider, &202u32, &false);
+
+    f.client
+        .upsert_service(&provider, &202u32, &label, &9_000_000i128);
+
+    assert!(!f.client.get_service(&provider, &202u32).available);
+}
+
+#[test]
+fn pausing_absent_service_errors() {
+    let f = setup();
+    let provider = register_active_provider(&f);
+    let err = f
+        .client
+        .try_set_service_available(&provider, &999u32, &false)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, RegistryError::ServiceNotFound);
+    assert!(!f.client.is_service_available(&provider, &999u32));
 }
 
 #[test]
@@ -576,6 +827,14 @@ const AUTH_MATRIX: &[AuthCase] = &[
         auth: signer("`provider_addr`", provider_addr),
     },
     AuthCase {
+        function: "schedule_service_price",
+        auth: signer("`provider_addr`", provider_addr),
+    },
+    AuthCase {
+        function: "set_service_available",
+        auth: signer("`provider_addr`", provider_addr),
+    },
+    AuthCase {
         function: "add_attester",
         auth: signer("`admin`", admin_addr),
     },
@@ -620,7 +879,19 @@ const AUTH_MATRIX: &[AuthCase] = &[
         auth: Auth::Free("none (view)"),
     },
     AuthCase {
+        function: "get_upcoming_price",
+        auth: Auth::Free("none (view)"),
+    },
+    AuthCase {
+        function: "is_service_available",
+        auth: Auth::Free("none (view)"),
+    },
+    AuthCase {
         function: "is_attester",
+        auth: Auth::Free("none (view)"),
+    },
+    AuthCase {
+        function: "version",
         auth: Auth::Free("none (view)"),
     },
 ];
@@ -668,6 +939,21 @@ fn run_case(f: &AuthFixture, function: &str) -> std::vec::Vec<Address> {
             upsert();
             client.remove_service(&f.provider, &CONSULT);
         }
+        "schedule_service_price" => {
+            activate(&f.f, &f.provider);
+            upsert();
+            client.schedule_service_price(&f.provider, &CONSULT, &PRICE, &MIN_PRICE_NOTICE_SECS);
+        }
+        "get_upcoming_price" => {
+            activate(&f.f, &f.provider);
+            upsert();
+            client.get_upcoming_price(&f.provider, &CONSULT);
+        }
+        "set_service_available" => {
+            activate(&f.f, &f.provider);
+            upsert();
+            client.set_service_available(&f.provider, &CONSULT, &false);
+        }
         "add_attester" => {
             client.add_attester(&f.f.admin, &f.new_provider);
         }
@@ -711,8 +997,16 @@ fn run_case(f: &AuthFixture, function: &str) -> std::vec::Vec<Address> {
             upsert();
             client.get_service_price(&f.provider, &CONSULT);
         }
+        "is_service_available" => {
+            activate(&f.f, &f.provider);
+            upsert();
+            client.is_service_available(&f.provider, &CONSULT);
+        }
         "is_attester" => {
             client.is_attester(&f.provider);
+        }
+        "version" => {
+            client.version();
         }
         other => {
             panic!("no call is defined for `{other}`, so the matrix test cannot check it")
@@ -1070,6 +1364,54 @@ fn service_removed_event_snapshot() {
     let e = one_event(&f);
     assert_layout(&e, "service_removed", &[ScVal::from(&provider)], &["code"]);
     assert_eq!(field_u32(&e, "code"), CONSULT);
+}
+
+#[test]
+fn service_price_scheduled_event_snapshot() {
+    let f = setup();
+    let provider = register_active_provider(&f);
+    f.client.upsert_service(
+        &provider,
+        &CONSULT,
+        &String::from_str(&f.env, "Outpatient consult"),
+        &PRICE,
+    );
+
+    f.client
+        .schedule_service_price(&provider, &CONSULT, &(PRICE * 2), &MIN_PRICE_NOTICE_SECS);
+
+    let e = one_event(&f);
+    assert_layout(
+        &e,
+        "service_price_scheduled",
+        &[ScVal::from(&provider), ScVal::U32(CONSULT)],
+        &["price", "effective_at"],
+    );
+    assert_eq!(field_i128(&e, "price"), PRICE * 2);
+    assert_eq!(field_u64(&e, "effective_at"), MIN_PRICE_NOTICE_SECS);
+}
+
+#[test]
+fn service_availability_changed_event_snapshot() {
+    let f = setup();
+    let provider = register_active_provider(&f);
+    f.client.upsert_service(
+        &provider,
+        &CONSULT,
+        &String::from_str(&f.env, "Outpatient consult"),
+        &PRICE,
+    );
+
+    f.client.set_service_available(&provider, &CONSULT, &false);
+
+    let e = one_event(&f);
+    assert_layout(
+        &e,
+        "service_availability_changed",
+        &[ScVal::from(&provider), ScVal::U32(CONSULT)],
+        &["available"],
+    );
+    assert_eq!(field(&e, "available"), ScVal::Bool(false));
 }
 
 #[test]

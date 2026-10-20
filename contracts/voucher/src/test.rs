@@ -5,9 +5,12 @@ use soroban_sdk::{
     token, Address, BytesN, Env, String,
 };
 
-use crate::{VoucherError, VoucherEscrow, VoucherEscrowClient, VoucherStatus};
+use crate::{
+    VoucherError, VoucherEscrow, VoucherEscrowClient, VoucherStatus,
+    DEFAULT_MAX_ATTESTATIONS_PER_DAY,
+};
 use sci_receipt::{ReceiptBook, ReceiptBookClient};
-use sci_registry::{ProviderStatus, Registry, RegistryClient};
+use sci_registry::{ProviderStatus, Registry, RegistryClient, MIN_PRICE_NOTICE_SECS};
 
 const DISPUTE_WINDOW: u64 = 72 * 60 * 60; // 72 hours
 const FEE_BPS: u32 = 100; // 1%
@@ -193,6 +196,76 @@ fn cannot_fund_unoffered_service() {
         .unwrap()
         .unwrap();
     assert_eq!(err, VoucherError::ServiceNotOffered);
+}
+
+#[test]
+fn cannot_fund_paused_service() {
+    let f = setup();
+    f.registry
+        .set_service_available(&f.provider, &CONSULT, &false);
+
+    let err = f
+        .voucher
+        .try_create_voucher(
+            &f.funder,
+            &patient(&f.env),
+            &f.provider,
+            &CONSULT,
+            &CONSULT_PRICE,
+            &(START_TIME + 1000),
+        )
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VoucherError::ServiceUnavailable);
+    assert_eq!(f.voucher.next_voucher_id(), 1, "no voucher was written");
+
+    // Resumed: funding works again.
+    f.registry
+        .set_service_available(&f.provider, &CONSULT, &true);
+    assert_eq!(fund(&f), 1);
+}
+
+#[test]
+fn pausing_a_service_does_not_affect_funded_vouchers() {
+    let f = setup();
+    let id = fund(&f);
+
+    f.registry
+        .set_service_available(&f.provider, &CONSULT, &false);
+
+    f.voucher.claim(&f.provider, &id);
+    f.voucher.attest(&f.attester, &id);
+    advance(&f.env, DISPUTE_WINDOW + 1);
+    f.voucher.settle(&id);
+    assert_eq!(f.voucher.get_voucher(&id).status, VoucherStatus::Settled);
+}
+
+#[test]
+fn scheduled_price_rise_applies_to_funding_at_the_effective_time() {
+    let f = setup();
+    let effective_at = START_TIME + MIN_PRICE_NOTICE_SECS;
+    f.registry
+        .schedule_service_price(&f.provider, &CONSULT, &(CONSULT_PRICE * 2), &effective_at);
+
+    // Before the effective time the listed price still funds.
+    assert_eq!(fund(&f), 1);
+
+    f.env.ledger().with_mut(|li| li.timestamp = effective_at);
+    let err = f
+        .voucher
+        .try_create_voucher(
+            &f.funder,
+            &patient(&f.env),
+            &f.provider,
+            &CONSULT,
+            &CONSULT_PRICE,
+            &(effective_at + 1000),
+        )
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VoucherError::AmountBelowPrice);
 }
 
 #[test]
@@ -679,6 +752,15 @@ fn cannot_resolve_undisputed_voucher() {
 // ----- config -----
 
 #[test]
+fn version_is_the_crate_version() {
+    let f = setup();
+    let version = f.voucher.version();
+    assert_eq!(version, String::from_str(&f.env, env!("CARGO_PKG_VERSION")));
+    // Every contract shares the workspace version.
+    assert_eq!(version, String::from_str(&f.env, "0.2.0"));
+}
+
+#[test]
 fn initialize_is_single_shot() {
     let f = setup();
     let a = Address::generate(&f.env);
@@ -784,6 +866,151 @@ fn accept_admin_without_proposal_errors() {
     let someone = Address::generate(&f.env);
     let err = f.voucher.try_accept_admin(&someone).err().unwrap().unwrap();
     assert_eq!(err, VoucherError::NoPendingAdmin);
+}
+
+// ----- attestation cap -----
+
+const DAY: u64 = 24 * 60 * 60;
+
+/// Funds and claims a fresh voucher, ready to attest.
+fn claimed(f: &Fixture) -> u64 {
+    let id = fund(f);
+    f.voucher.claim(&f.provider, &id);
+    id
+}
+
+#[test]
+fn attestation_cap_defaults_and_counts_down() {
+    let f = setup();
+    assert_eq!(
+        f.voucher.get_attestation_cap(),
+        DEFAULT_MAX_ATTESTATIONS_PER_DAY
+    );
+    assert_eq!(
+        f.voucher.attestations_left(&f.attester),
+        DEFAULT_MAX_ATTESTATIONS_PER_DAY
+    );
+
+    let id = claimed(&f);
+    f.voucher.attest(&f.attester, &id);
+
+    assert_eq!(
+        f.voucher.attestations_left(&f.attester),
+        DEFAULT_MAX_ATTESTATIONS_PER_DAY - 1
+    );
+}
+
+#[test]
+fn attestation_cap_is_enforced_and_resets_next_utc_day() {
+    let f = setup();
+    f.voucher.set_attestation_cap(&f.admin, &2);
+    let ids = [claimed(&f), claimed(&f), claimed(&f)];
+
+    f.voucher.attest(&f.attester, &ids[0]);
+    f.voucher.attest(&f.attester, &ids[1]);
+    assert_eq!(f.voucher.attestations_left(&f.attester), 0);
+
+    let err = f
+        .voucher
+        .try_attest(&f.attester, &ids[2])
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VoucherError::AttestationCapReached);
+    assert_eq!(
+        f.voucher.get_voucher(&ids[2]).status,
+        VoucherStatus::Claimed
+    );
+
+    // Still the same UTC day one second before midnight.
+    let midnight = (START_TIME / DAY + 1) * DAY;
+    f.env.ledger().with_mut(|li| li.timestamp = midnight - 1);
+    let err = f
+        .voucher
+        .try_attest(&f.attester, &ids[2])
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VoucherError::AttestationCapReached);
+
+    // The counter resets at the UTC day boundary.
+    f.env.ledger().with_mut(|li| li.timestamp = midnight);
+    assert_eq!(f.voucher.attestations_left(&f.attester), 2);
+    f.voucher.attest(&f.attester, &ids[2]);
+    assert_eq!(
+        f.voucher.get_voucher(&ids[2]).status,
+        VoucherStatus::Attested
+    );
+}
+
+#[test]
+fn attestation_cap_is_per_attester() {
+    let f = setup();
+    f.voucher.set_attestation_cap(&f.admin, &1);
+    let other = Address::generate(&f.env);
+    f.registry.add_attester(&f.admin, &other);
+    let ids = [claimed(&f), claimed(&f)];
+
+    f.voucher.attest(&f.attester, &ids[0]);
+    f.voucher.attest(&other, &ids[1]);
+
+    assert_eq!(f.voucher.attestations_left(&f.attester), 0);
+    assert_eq!(f.voucher.attestations_left(&other), 0);
+}
+
+#[test]
+fn rejected_attestation_does_not_use_the_allowance() {
+    let f = setup();
+    let unclaimed = fund(&f);
+
+    assert!(f.voucher.try_attest(&f.attester, &unclaimed).is_err());
+
+    assert_eq!(
+        f.voucher.attestations_left(&f.attester),
+        DEFAULT_MAX_ATTESTATIONS_PER_DAY
+    );
+}
+
+#[test]
+fn lowering_the_cap_applies_to_today() {
+    let f = setup();
+    let ids = [claimed(&f), claimed(&f)];
+    f.voucher.attest(&f.attester, &ids[0]);
+
+    f.voucher.set_attestation_cap(&f.admin, &1);
+
+    assert_eq!(f.voucher.attestations_left(&f.attester), 0);
+    let err = f
+        .voucher
+        .try_attest(&f.attester, &ids[1])
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VoucherError::AttestationCapReached);
+}
+
+#[test]
+fn only_admin_sets_a_positive_attestation_cap() {
+    let f = setup();
+    let err = f
+        .voucher
+        .try_set_attestation_cap(&f.funder, &5)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VoucherError::NotAuthorized);
+
+    let err = f
+        .voucher
+        .try_set_attestation_cap(&f.admin, &0)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VoucherError::InvalidAttestationCap);
+    assert_eq!(
+        f.voucher.get_attestation_cap(),
+        DEFAULT_MAX_ATTESTATIONS_PER_DAY
+    );
 }
 
 #[test]
@@ -1021,11 +1248,16 @@ fn attest_event_snapshot_carries_service_and_amount() {
     assert_eq!(field_u32(&e, "service_code"), CONSULT);
     assert_eq!(field_i128(&e, "amount"), CONSULT_PRICE);
     assert_eq!(
+        field_u32(&e, "remaining_today"),
+        DEFAULT_MAX_ATTESTATIONS_PER_DAY - 1
+    );
+    assert_eq!(
         field_names(&e),
         [
             "amount",
             "attested_at",
             "dispute_deadline",
+            "remaining_today",
             "service_code",
             "voucher_id",
         ],
@@ -1230,12 +1462,24 @@ const AUTH_MATRIX: &[AuthCase] = &[
         auth: signer("`admin`", admin_addr),
     },
     AuthCase {
+        function: "set_attestation_cap",
+        auth: signer("`admin`", admin_addr),
+    },
+    AuthCase {
         function: "propose_admin",
         auth: signer("`admin`", admin_addr),
     },
     AuthCase {
         function: "accept_admin",
         auth: signer("`new_admin`", new_admin_addr),
+    },
+    AuthCase {
+        function: "get_attestation_cap",
+        auth: Auth::Free("none (view)"),
+    },
+    AuthCase {
+        function: "attestations_left",
+        auth: Auth::Free("none (view)"),
     },
     AuthCase {
         function: "get_pending_admin",
@@ -1259,6 +1503,10 @@ const AUTH_MATRIX: &[AuthCase] = &[
     },
     AuthCase {
         function: "quote",
+        auth: Auth::Free("none (view)"),
+    },
+    AuthCase {
+        function: "version",
         auth: Auth::Free("none (view)"),
     },
 ];
@@ -1332,6 +1580,15 @@ fn run_case(f: &AuthFixture, function: &str) -> std::vec::Vec<Address> {
             voucher.dispute(&f.f.funder, &id, &1u32);
             voucher.resolve_dispute(&f.f.admin, &id, &true);
         }
+        "set_attestation_cap" => {
+            voucher.set_attestation_cap(&f.f.admin, &10);
+        }
+        "get_attestation_cap" => {
+            voucher.get_attestation_cap();
+        }
+        "attestations_left" => {
+            voucher.attestations_left(&f.f.attester);
+        }
         "propose_admin" => {
             voucher.propose_admin(&f.f.admin, &f.new_admin);
         }
@@ -1358,6 +1615,9 @@ fn run_case(f: &AuthFixture, function: &str) -> std::vec::Vec<Address> {
         }
         "quote" => {
             voucher.quote(&CONSULT_PRICE);
+        }
+        "version" => {
+            voucher.version();
         }
         other => {
             panic!("no call is defined for `{other}`, so the matrix test cannot check it")
@@ -1811,6 +2071,22 @@ fn admin_proposed_event_snapshot() {
         &["pending_admin"],
     );
     assert_eq!(field_address(&f.env, &e, "pending_admin"), nominee);
+}
+
+#[test]
+fn attestation_cap_changed_event_snapshot() {
+    let f = setup();
+
+    f.voucher.set_attestation_cap(&f.admin, &25);
+
+    let e = one_event(&f);
+    assert_layout(
+        &e,
+        "attestation_cap_changed",
+        &[ScVal::from(&f.admin)],
+        &["cap"],
+    );
+    assert_eq!(field_u32(&e, "cap"), 25);
 }
 
 #[test]

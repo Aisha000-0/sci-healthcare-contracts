@@ -35,6 +35,9 @@ pub struct ServiceItem {
     pub label: String,
     pub price: i128,
     pub active: bool,
+    pub available: bool,      // false while the clinic has paused it
+    pub pending_price: i128,  // scheduled price, 0 if none
+    pub effective_at: u64,    // when pending_price applies, 0 if none
 }
 ```
 
@@ -45,8 +48,10 @@ pub struct ServiceItem {
 | `initialize` | `admin: Address` | `()` | once | `AlreadyInitialized` |
 | `register_provider` | `owner, name, country` | `()` | `owner` | `EmptyName`, `InvalidCountry`, `ProviderExists` |
 | `set_provider_status` | `admin, provider_addr, status` | `()` | `admin` | `NotAuthorized`, `ProviderNotFound` |
-| `upsert_service` | `provider_addr, code, label, price` | `()` | `provider_addr` | `InvalidPrice`, `EmptyName`, `ProviderNotActive` |
+| `upsert_service` | `provider_addr, code, label, price` | `()` | `provider_addr` | `InvalidPrice`, `EmptyName`, `ProviderNotActive`, `PriceIncreaseNeedsNotice` |
+| `schedule_service_price` | `provider_addr, code, price, effective_at` | `()` | `provider_addr` | `InvalidPrice`, `ProviderNotActive`, `ServiceNotFound`, `PriceNoticeTooShort` |
 | `remove_service` | `provider_addr, code` | `()` | `provider_addr` | `ServiceNotFound` |
+| `set_service_available` | `provider_addr, code, available: bool` | `()` | `provider_addr` | `ServiceNotFound` |
 | `add_attester` | `admin, attester` | `()` | `admin` | `NotAuthorized` |
 | `remove_attester` | `admin, attester` | `()` | `admin` | `NotAuthorized` |
 | `propose_admin` | `admin, new_admin` | `()` | `admin` | `NotAuthorized` |
@@ -57,10 +62,19 @@ pub struct ServiceItem {
 | `get_service` | `provider_addr, code` | `ServiceItem` | view | `ServiceNotFound` |
 | `get_services` | `provider_addr, codes: Vec<u32>` | `Vec<ServiceItem>` | view | — |
 | `get_service_price` | `provider_addr, code` | `i128` | view | — |
+| `get_upcoming_price` | `provider_addr, code` | `(i128, u64)` | view | `ServiceNotFound` |
+| `is_service_available` | `provider_addr, code` | `bool` | view | — |
 | `is_attester` | `addr` | `bool` | view | — |
 | `get_admin` | — | `Address` | view | `NotInitialized` |
+| `version` | — | `String` | view | — |
 
 `get_service_price` returns `0` when the service is absent or inactive. It exists so `voucher` can validate pricing over an interface of primitives only, without the two contracts sharing types.
+
+A clinic that temporarily cannot deliver a service (out of test kits, say) calls `set_service_available(provider_addr, code, false)` instead of delisting it. The service keeps its catalogue entry and its price, `is_service_available` returns `false`, and `voucher` refuses to fund it with `ServiceUnavailable`. Vouchers already funded against it are unaffected. `upsert_service` keeps a paused service paused; only `set_service_available(…, true)` puts it back on sale. New services are listed as available.
+
+Price changes are scheduled, not sprung. `schedule_service_price(provider_addr, code, price, effective_at)` records a new price that takes effect at `effective_at`, which must be at least `MIN_PRICE_NOTICE_SECS` (24 hours) away or the call fails with `PriceNoticeTooShort`. Until then `get_service_price` returns the current price and `get_upcoming_price` returns `(price, effective_at)` so apps can warn funders; from `effective_at` on, every read returns the new price — no keeper has to call in. Scheduling again replaces the earlier schedule, and scheduling the current price calls a change off. `upsert_service` still lists a new service, or lowers an existing price, at once, but rejects a rise with `PriceIncreaseNeedsNotice`. A service that is removed and listed again starts fresh, at whatever price it is listed with.
+
+Every contract — registry, voucher, receipt and faucet — has a `version()` view returning the crate version it was built from (`CARGO_PKG_VERSION`, the workspace version, currently `0.2.0`). Use it to tell which build a deployment runs before relying on a newer function.
 
 ### Authorisation matrix
 
@@ -72,7 +86,9 @@ Every public function, with the exact signer it demands — no signature that is
 | `register_provider` | `owner` |
 | `set_provider_status` | `admin` |
 | `upsert_service` | `provider_addr` |
+| `schedule_service_price` | `provider_addr` |
 | `remove_service` | `provider_addr` |
+| `set_service_available` | `provider_addr` |
 | `add_attester` | `admin` |
 | `remove_attester` | `admin` |
 | `propose_admin` | `admin` |
@@ -84,7 +100,10 @@ Every public function, with the exact signer it demands — no signature that is
 | `get_service` | none (view) |
 | `get_services` | none (view) |
 | `get_service_price` | none (view) |
+| `get_upcoming_price` | none (view) |
+| `is_service_available` | none (view) |
 | `is_attester` | none (view) |
+| `version` | none (view) |
 
 A signer is not the same as a role: `admin` must be the stored admin **and** sign, and the two checks are ordered so a wrong `admin` argument fails before any signature is requested.
 
@@ -103,10 +122,12 @@ A signer is not the same as a role: `admin` must be the stored admin **and** sig
 | 9 | `InvalidCountry` |
 | 10 | `EmptyName` |
 | 11 | `NoPendingAdmin` |
+| 12 | `PriceNoticeTooShort` |
+| 13 | `PriceIncreaseNeedsNotice` |
 
 ### Events
 
-`provider_registered`, `provider_status_changed`, `service_upserted`, `service_removed`, `attester_added`, `attester_removed`, `admin_changed`, `initialized`
+`provider_registered`, `provider_status_changed`, `service_upserted`, `service_removed`, `service_price_scheduled` (topics `provider`, `code`; data `price`, `effective_at`), `service_availability_changed` (topics `provider`, `code`; data `available`), `attester_added`, `attester_removed`, `admin_changed`, `initialized`
 
 ---
 
@@ -150,14 +171,18 @@ pub struct Voucher {
 | `settle` | `voucher_id` | `()` | **none** |
 | `refund` | `voucher_id` | `()` | **none** |
 | `resolve_dispute` | `admin, voucher_id, refund_funder: bool` | `()` | `admin` |
+| `set_attestation_cap` | `admin, cap: u32` | `()` | `admin` |
 | `propose_admin` | `admin, new_admin` | `()` | `admin` |
 | `accept_admin` | `new_admin` | `()` | `new_admin` |
 | `get_voucher` | `voucher_id` | `Voucher` | view |
 | `refundable_at` | `voucher_id` | `u64` | view |
+| `get_attestation_cap` | — | `u32` | view |
+| `attestations_left` | `attester` | `u32` | view |
 | `get_pending_admin` | — | `Option<Address>` | view |
 | `get_config` | — | `Config` | view |
 | `next_voucher_id` | — | `u64` | view |
 | `quote` | `amount` | `(i128, i128)` | view |
+| `version` | — | `String` | view |
 
 `fee_bps` is capped at 1000 (10%) at initialisation.
 
@@ -177,14 +202,18 @@ Every public function, with the exact signer it demands. `AUTH_MATRIX` in `contr
 | `settle` | none (permissionless) |
 | `refund` | none (permissionless) |
 | `resolve_dispute` | `admin` |
+| `set_attestation_cap` | `admin` |
 | `propose_admin` | `admin` |
 | `accept_admin` | `new_admin` |
+| `get_attestation_cap` | none (view) |
+| `attestations_left` | none (view) |
 | `get_pending_admin` | none (view) |
 | `refundable_at` | none (view) |
 | `get_voucher` | none (view) |
 | `get_config` | none (view) |
 | `next_voucher_id` | none (view) |
 | `quote` | none (view) |
+| `version` | none (view) |
 
 `settle` and `refund` are the two permissionless rows, and that is the point:
 anyone may trigger them, so a provider is never dependent on the funder or an
@@ -193,11 +222,13 @@ rejects the voucher's own provider even if it holds that role.
 
 ### What each function checks
 
-**`create_voucher`** — amount > 0; expiry in the future; provider is `Active`; the service exists and is active; amount ≥ listed price. Transfers the token *before* writing the voucher, so a failed transfer reverts everything.
+**`create_voucher`** — amount > 0; expiry in the future; provider is `Active`; the service exists and is active; amount ≥ listed price; the service is not paused (`ServiceUnavailable`). Transfers the token *before* writing the voucher, so a failed transfer reverts everything.
 
 **`claim`** — caller is the named provider; provider is still `Active` in the registry; status is `Funded`; not expired.
 
-**`attest`** — caller is a registry attester; caller is **not** the provider; status is `Claimed`. Sets `dispute_deadline = now + dispute_window`.
+**`attest`** — caller is a registry attester; caller is **not** the provider; status is `Claimed`; the attester has attestations left today. Sets `dispute_deadline = now + dispute_window`.
+
+**`set_attestation_cap`** — caller is admin; `cap` ≥ 1 (`InvalidAttestationCap`). Each attester may attest at most `cap` vouchers per UTC day (`timestamp / 86400`); the next is rejected with `AttestationCapReached` until midnight UTC, when the counter resets. The default is `DEFAULT_MAX_ATTESTATIONS_PER_DAY` (100). Counters live in temporary storage keyed by `(attester, day)`. The cap bounds what a stolen attester key can confirm before the admin removes it from the registry; `attestations_left(attester)` and the `remaining_today` field of `voucher_attested` show how close an attester is.
 
 **`dispute`** — caller is the funder; status is `Claimed`, or `Attested` and before the deadline.
 
@@ -222,6 +253,9 @@ rejects the voucher's own provider even if it holds that role.
 | 7 | `AmountBelowPrice` | 15 | `InvalidFee` |
 | 8 | `InvalidAmount` | 16 | `MathOverflow` |
 |  |  | 17 | `NoPendingAdmin` |
+|  |  | 18 | `ServiceUnavailable` |
+|  |  | 19 | `AttestationCapReached` |
+|  |  | 20 | `InvalidAttestationCap` |
 
 ### Events
 
@@ -229,11 +263,12 @@ rejects the voucher's own provider even if it holds that role.
 | --- | --- | --- |
 | `voucher_created` | `funder`, `provider`, `beneficiary_ref` | `voucher_id`, `service_code`, `amount`, `created_at`, `expires_at` |
 | `voucher_claimed` | `provider` | `voucher_id`, `claimed_at`, `service_code`, `amount` |
-| `voucher_attested` | `attester` | `voucher_id`, `attested_at`, `dispute_deadline`, `service_code`, `amount` |
+| `voucher_attested` | `attester` | `voucher_id`, `attested_at`, `dispute_deadline`, `service_code`, `amount`, `remaining_today` |
 | `voucher_disputed` | `funder` | `voucher_id`, `reason_code`, `service_code`, `amount` |
 | `voucher_settled` | `provider` | `voucher_id`, `net`, `fee`, `service_code`, `amount` |
 | `voucher_refunded` | `funder` | `voucher_id`, `amount`, `service_code` |
 | `dispute_resolved` | `admin` | `voucher_id`, `refunded_funder` |
+| `attestation_cap_changed` | `admin` | `cap` |
 
 > Fields listed under **Topics** are published in the event's topic list, **not** in its data map. An indexer reading them off the data map gets `undefined`.
 >
@@ -274,6 +309,7 @@ pub struct Receipt {
 | `receipt_uri` | `voucher_id` | `String` | none (view) |
 | `get_minter` | — | `Address` | view |
 | `get_admin` | — | `Address` | view |
+| `version` | — | `String` | view |
 
 Only the minter — the voucher contract — may mint. Because the voucher contract does not exist when the receipt book is initialised, deploy order is: receipt, voucher, then `set_minter`.
 
@@ -298,6 +334,7 @@ Every public function, with the exact signer it demands. `AUTH_MATRIX` in `contr
 | `receipt_uri` | none (view) |
 | `get_minter` | none (view) |
 | `get_admin` | none (view) |
+| `version` | none (view) |
 
 ### Errors
 
@@ -328,6 +365,7 @@ Lets anyone trying the demo get test USDC without a server holding the issuer ke
 | `release_token_admin` | `admin, new_admin` | `()` | `admin` |
 | `get_config` | — | `FaucetConfig` | view |
 | `next_drip_at` | `to` | `u64` (0 if allowed now) | view |
+| `version` | — | `String` | view |
 
 `drip` requires the recipient's signature, so one wallet cannot drain the faucet into addresses it does not control, and each address may drip once per `cooldown`. A classic account needs a trustline for the token first; the token reports a missing one as its error `#13`.
 
