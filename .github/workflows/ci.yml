@@ -152,15 +152,15 @@ jobs:
           mkdir -p /tmp/build1
           cp -r . /tmp/build1/src
           mkdir -p /tmp/cargo-home-1
-          cd /tmp/build1/src && CARGO_HOME=/tmp/cargo-home-1 ./scripts/build-wasm.sh dist1
-          mkdir -p dist1 && cp /tmp/build1/src/dist1/* dist1/
+          cd /tmp/build1/src && CARGO_HOME=/tmp/cargo-home-1 ./scripts/build-wasm.sh /tmp/build1-dist
+          mkdir -p dist1 && cp /tmp/build1-dist/* dist1/
       - name: Second build
         run: |
           mkdir -p /tmp/build2
           cp -r . /tmp/build2/src
           mkdir -p /tmp/cargo-home-2
-          cd /tmp/build2/src && CARGO_HOME=/tmp/cargo-home-2 ./scripts/build-wasm.sh dist2
-          mkdir -p dist2 && cp /tmp/build2/src/dist2/* dist2/
+          cd /tmp/build2/src && CARGO_HOME=/tmp/cargo-home-2 ./scripts/build-wasm.sh /tmp/build2-dist
+          mkdir -p dist2 && cp /tmp/build2-dist/* dist2/
       - name: Compare checksums
         run: |
           if ! diff dist1/SHA256SUMS dist2/SHA256SUMS; then
