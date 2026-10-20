@@ -40,6 +40,7 @@ mod types;
 #[cfg(test)]
 mod test;
 
+use sci_common as common;
 use soroban_sdk::{contract, contractimpl, token, Address, BytesN, Env, String};
 
 #[allow(unused_imports)]
@@ -52,9 +53,9 @@ pub use interfaces::{ReceiptClient, RegistryClient};
 pub use types::{Config, DataKey, Voucher, VoucherError, VoucherStatus};
 
 use storage::{
-    bump_next_id, clear_pending_admin, extend_instance, has_config, peek_next_id,
-    read_attestation_cap, read_attestations, read_config, read_pending_admin, read_voucher,
-    write_attestation_cap, write_attestations, write_config, write_pending_admin, write_voucher,
+    bump_next_id, extend_instance, has_config, peek_next_id, read_attestation_cap,
+    read_attestations, read_config, read_voucher, write_attestation_cap, write_attestations,
+    write_config, write_voucher,
 };
 
 const BPS_DENOMINATOR: i128 = 10_000;
@@ -395,10 +396,7 @@ impl VoucherEscrow {
         refund_funder: bool,
     ) -> Result<(), VoucherError> {
         let config = read_config(&env)?;
-        if config.admin != admin {
-            return Err(VoucherError::NotAuthorized);
-        }
-        admin.require_auth();
+        common::require_admin(&config.admin, &admin)?;
 
         let mut voucher = read_voucher(&env, voucher_id)?;
         if voucher.status != VoucherStatus::Disputed {
@@ -428,13 +426,9 @@ impl VoucherEscrow {
     /// dispute resolution. Proposing again replaces the earlier nominee.
     pub fn propose_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), VoucherError> {
         let config = read_config(&env)?;
-        if config.admin != admin {
-            return Err(VoucherError::NotAuthorized);
-        }
-        admin.require_auth();
+        common::require_admin(&config.admin, &admin)?;
 
-        write_pending_admin(&env, &new_admin);
-        extend_instance(&env);
+        common::propose_admin(&env, &DataKey::PendingAdmin, &new_admin);
         AdminProposed {
             admin,
             pending_admin: new_admin,
@@ -445,17 +439,11 @@ impl VoucherEscrow {
 
     /// The nominated address accepts and becomes admin.
     pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), VoucherError> {
-        let pending = read_pending_admin(&env).ok_or(VoucherError::NoPendingAdmin)?;
-        if pending != new_admin {
-            return Err(VoucherError::NotAuthorized);
-        }
-        new_admin.require_auth();
+        let new_admin = common::take_pending_admin(&env, &DataKey::PendingAdmin, &new_admin)?;
 
         let mut config = read_config(&env)?;
         config.admin = new_admin.clone();
         write_config(&env, &config);
-        clear_pending_admin(&env);
-        extend_instance(&env);
         AdminChanged { new_admin }.publish(&env);
         Ok(())
     }
@@ -466,10 +454,7 @@ impl VoucherEscrow {
     /// 1: to stop an attester entirely, remove it from the registry.
     pub fn set_attestation_cap(env: Env, admin: Address, cap: u32) -> Result<(), VoucherError> {
         let config = read_config(&env)?;
-        if config.admin != admin {
-            return Err(VoucherError::NotAuthorized);
-        }
-        admin.require_auth();
+        common::require_admin(&config.admin, &admin)?;
         if cap == 0 {
             return Err(VoucherError::InvalidAttestationCap);
         }
@@ -494,7 +479,7 @@ impl VoucherEscrow {
     }
 
     pub fn get_pending_admin(env: Env) -> Option<Address> {
-        read_pending_admin(&env)
+        common::read_pending_admin(&env, &DataKey::PendingAdmin)
     }
 
     /// Earliest ledger time at which `refund` will succeed, or
