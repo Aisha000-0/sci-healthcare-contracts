@@ -38,6 +38,8 @@ mod storage;
 mod types;
 
 #[cfg(test)]
+mod economics_test;
+#[cfg(test)]
 mod test;
 
 use sci_common as common;
