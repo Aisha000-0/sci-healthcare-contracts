@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- `examples/lifecycle.ts`: a runnable TypeScript walkthrough of the full voucher lifecycle (fund → claim → attest → settle) using `@stellar/stellar-sdk` and local keys, with a README section and a CI type-check job. See "Run the lifecycle in TypeScript".
+
 ## 0.2.0 — 2026-10-09
 
 Redeployed to testnet on 2026-10-07; addresses are in `deployments/testnet.env`.
