@@ -12,8 +12,9 @@ A voucher is one commitment to pay one clinic for one service. It moves through 
   Funded ──────────────> Claimed ───────────> Attested ────────> Settled
     │                       │                     │
     │ refund                │ dispute             │ dispute
-    │ (past expiry)         ▼                     ▼
-    ▼                    Disputed <───────────────┘
+    │ (expired or           ▼                     ▼
+    │  clinic inactive)  Disputed <───────────────┘
+    ▼                       │
  Refunded  <──── resolve ────┴──── resolve ────> Settled
     ▲
     └── refund (Claimed, never attested, 7 days past expiry)
@@ -29,7 +30,7 @@ The funder has called `create_voucher`. USDC has moved from their account into t
 
 Before accepting the money the contract checks three things: the clinic is `Active` in the registry, the clinic actually offers that service, and the amount is at least the listed price. If any fails, nothing moves.
 
-**Who can act:** the clinic can `claim`. After expiry, anyone can `refund`.
+**Who can act:** the clinic can `claim`. After expiry, anyone can `refund`; if the clinic is no longer active in the registry, anyone can refund at once, before expiry.
 
 ### Claimed
 
@@ -37,7 +38,7 @@ The patient turned up and the clinic called `claim`. This is the clinic saying "
 
 A voucher cannot be claimed after it expires, and a clinic that has been suspended since the voucher was funded cannot claim it at all.
 
-**Who can act:** an attester can `attest`. The funder can `dispute`. If no attestation arrives, anyone can `refund` once the voucher is seven days past its expiry — the claim grace period.
+**Who can act:** an attester can `attest`. The funder can `dispute`. If no attestation arrives, anyone can `refund` once the voucher is seven days past its expiry — the claim grace period. A suspension does not shorten this path, because care may already have been given.
 
 The grace period exists so that a claim on its own can never hold the funder's money hostage. Seven days gives a slow attester time to confirm care that happened just before expiry; after that, the money goes home.
 
@@ -72,7 +73,7 @@ New codes may be added. Existing codes are never renumbered.
 
 ### Refunded
 
-The voucher expired unclaimed, or it was claimed but never attested within the grace period, or a dispute was resolved in the funder's favour. The **full** amount goes back — no fee is taken on care that did not happen.
+The voucher expired unclaimed, the clinic was no longer active before it could be claimed, it was claimed but never attested within the grace period, or a dispute was resolved in the funder's favour. The **full** amount goes back — no fee is taken on care that did not happen.
 
 ## A worked example
 

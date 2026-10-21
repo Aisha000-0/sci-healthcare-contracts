@@ -667,6 +667,83 @@ fn cannot_refund_before_expiry() {
 }
 
 #[test]
+fn active_clinic_funded_voucher_still_requires_expiry() {
+    // The new early-refund path is only for clinics that can no longer
+    // serve the voucher. An active clinic keeps the original expiry rule.
+    let f = setup();
+    let id = fund(&f);
+    let expires_at = f.voucher.get_voucher(&id).expires_at;
+
+    assert_eq!(f.voucher.refundable_at(&id), expires_at);
+    assert!(f.env.ledger().timestamp() < expires_at);
+
+    let err = f.voucher.try_refund(&id).err().unwrap().unwrap();
+    assert_eq!(err, VoucherError::NotYetExpired);
+    assert_eq!(f.voucher.get_voucher(&id).status, VoucherStatus::Funded);
+}
+
+#[test]
+fn funded_voucher_of_suspended_clinic_refunds_immediately() {
+    // A suspended clinic cannot serve a funded voucher, so the funder must
+    // not wait until expiry to get the money back.
+    let f = setup();
+    let before = f.token.balance(&f.funder);
+    let id = fund(&f);
+    let expires_at = f.voucher.get_voucher(&id).expires_at;
+
+    f.registry
+        .set_provider_status(&f.admin, &f.provider, &ProviderStatus::Suspended);
+    assert!(f.env.ledger().timestamp() < expires_at);
+
+    assert_eq!(
+        f.voucher.refundable_at(&id),
+        f.env.ledger().timestamp(),
+        "a suspended clinic's funder should not wait for expiry"
+    );
+
+    f.voucher.refund(&id);
+
+    // Full refund, no fee, and the provider gets nothing.
+    assert_eq!(f.token.balance(&f.funder), before);
+    assert_eq!(f.token.balance(&f.provider), 0);
+    assert_eq!(f.token.balance(&f.fee_account), 0);
+    assert_eq!(f.voucher.get_voucher(&id).status, VoucherStatus::Refunded);
+}
+
+#[test]
+fn claimed_voucher_of_suspended_clinic_keeps_claim_grace() {
+    // A claim means care may already have been given before the suspension.
+    // Keep the normal path: an attester still has the claim grace to confirm
+    // delivery, and only then can the funder take the money back.
+    let f = setup();
+    let before = f.token.balance(&f.funder);
+    let id = fund(&f);
+    f.voucher.claim(&f.provider, &id);
+
+    f.registry
+        .set_provider_status(&f.admin, &f.provider, &ProviderStatus::Suspended);
+
+    let expires_at = f.voucher.get_voucher(&id).expires_at;
+    let refundable_at = expires_at + crate::CLAIM_GRACE_SECS;
+
+    // A day past expiry: suspension does not shorten the claim grace.
+    f.env
+        .ledger()
+        .with_mut(|li| li.timestamp = expires_at + 24 * 60 * 60);
+    assert_eq!(f.voucher.refundable_at(&id), refundable_at);
+
+    let err = f.voucher.try_refund(&id).err().unwrap().unwrap();
+    assert_eq!(err, VoucherError::NotYetExpired);
+    assert_eq!(f.voucher.get_voucher(&id).status, VoucherStatus::Claimed);
+
+    f.env.ledger().with_mut(|li| li.timestamp = refundable_at);
+    f.voucher.refund(&id);
+
+    assert_eq!(f.token.balance(&f.funder), before);
+    assert_eq!(f.voucher.get_voucher(&id).status, VoucherStatus::Refunded);
+}
+
+#[test]
 fn claimed_voucher_is_locked_during_claim_grace() {
     // One day past expiry: the attester still has time to confirm care
     // that happened just before the voucher ran out.
