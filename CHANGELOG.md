@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- **voucher:** `reduce_amount(funder, voucher_id, new_amount)` lets a funder recover an overpayment without giving up the voucher. While the voucher is still `Funded`, the escrowed amount can be brought down to the clinic's listed price — never below it — and the difference goes straight back to the funder, with no fee taken on money that never became care. The floor is the price the registry lists **at call time**: a raised price cannot be undercut, and a lowered price frees the funder to reduce further. A voucher whose service has been delisted cannot be reduced (there is no price to reduce towards) and is refunded at expiry instead, and a claimed voucher cannot be reduced at all — the amount is what the clinic expects to be paid. The new `voucher_amount_reduced` event (topics `funder`; data `voucher_id`, `service_code`, `previous_amount`, `amount`, `refunded`) needs one line in the indexer: `voucher_amount_reduced: ['funder']` in `TOPIC_FIELDS` in `sci-healthcare-backend/src/stellar/events.ts`. Its data fields are read by name and need no decoder change; until the line is added the event still decodes, but its `funder` topic reads as `undefined`. The new `AmountNotReduced` error is #21. Closes #89.
 - **voucher:** `refund` now returns a `Funded` voucher immediately when its clinic is no longer active in the registry, instead of making the funder wait for expiry. `refundable_at` reports the current ledger time in that case. `Claimed` vouchers keep the normal seven-day claim grace even if the clinic is later suspended, because care may already have been given. No event or storage layout changes; the existing `voucher_refunded` event is reused, so the backend decoder needs no update.
 - **test:** every error variant in `VoucherError`, `RegistryError`, `ReceiptError` and `FaucetError` now has a dedicated test that triggers it, satisfying the requirement that all error codes are reachable and tested. Closes #109.
 - **ci:** `unwrap()` and `expect()` are now denied in contract code (outside tests) via `#![deny(clippy::unwrap_used, clippy::expect_used)]` gated to non-test builds. Existing uses were replaced with proper error returns. CI fails on any new unwrap in contract code. Closes #110.
@@ -55,7 +56,7 @@
 - **cargo:** the workspace path dependencies carry a version, so `cargo deny` does not read them as wildcard version requirements.
 - **voucher:** `voucher_claimed`, `voucher_attested`, `voucher_disputed`, `voucher_settled` and `voucher_refunded` now carry `service_code` and `amount` in their data, appended after the fields each event already had. Only `voucher_created` used to say what the voucher was for, so an indexer or wallet reading a single lifecycle event had to load the voucher to show what was paid for. `voucher_refunded` already carried `amount`; it gains `service_code` only. Topics are unchanged and the data map is keyed by name, so the indexer in `sci-healthcare-backend` decodes the new layout without a breaking change (its matching decoder change is linked from the pull request). Covered by five event snapshot tests in `contracts/voucher/src/test.rs` that read the decoded XDR event and the regenerated `test_snapshots`.
 
-Tests: 189 (was 186).
+Tests: 202 (was 189).
 
 ## 0.2.0 — 2026-10-09
 

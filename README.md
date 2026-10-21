@@ -234,6 +234,7 @@ deployed contract.
 | --- | --- | --- |
 | `initialize(admin, registry, receipt_book, token, dispute_window, fee_bps, fee_account)` | once | Fixes protocol config; fee capped at 10% |
 | `create_voucher(funder, beneficiary_ref, provider, service_code, amount, expires_at)` | funder | Escrows funds against one service at one active provider |
+| `reduce_amount(funder, voucher_id, new_amount)` | funder | Returns an overpayment to the funder while the voucher is still `Funded` |
 | `claim(provider, voucher_id)` | provider | Marks the patient as presented |
 | `attest(attester, voucher_id)` | attester | Confirms delivery; opens the dispute window |
 | `dispute(funder, voucher_id, reason_code)` | funder | Contests before the window closes |

@@ -112,6 +112,9 @@ pub enum VoucherError {
     AttestationCapReached = 19,
     /// The attestation cap must be at least 1.
     InvalidAttestationCap = 20,
+    /// The new amount is not lower than the amount already escrowed, so
+    /// there is nothing to give back.
+    AmountNotReduced = 21,
 }
 
 /// Maps the shared helpers' failures onto this contract's error numbers, so

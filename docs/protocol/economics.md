@@ -53,6 +53,7 @@ stellar contract invoke --id "$VOUCHER_CONTRACT_ID" --source-account sci-admin \
 ### What is not charged
 
 - **Refunds are free.** An expired or successfully disputed voucher returns the full amount. No fee is taken on care that did not happen.
+- **Reducing an overpayment is free.** `reduce_amount` returns the difference between what was escrowed and the clinic's listed price to the funder. No fee is taken on money that never became care.
 - **Funding is free.** The fee is taken once, at settlement.
 - **No spread.** The protocol does not convert currency and takes no exchange margin.
 
@@ -67,6 +68,7 @@ This matters more than it sounds. A voucher's whole lifecycle is four transactio
 | Action | Who submits | Who pays the network fee |
 | --- | --- | --- |
 | `create_voucher` | Funder | Funder |
+| `reduce_amount` | Funder | Funder |
 | `claim` | Clinic | Clinic |
 | `attest` | Attester | Attester |
 | `settle` | Anyone | Whoever submits |

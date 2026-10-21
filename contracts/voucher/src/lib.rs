@@ -53,8 +53,8 @@ use soroban_sdk::{contract, contractimpl, token, Address, BytesN, Env, String};
 #[allow(unused_imports)]
 pub use events::{
     AdminChanged, AdminProposed, AttestationCapChanged, DisputeResolved, Initialized,
-    VoucherAttested, VoucherClaimed, VoucherCreated, VoucherDisputed, VoucherRefunded,
-    VoucherSettled,
+    VoucherAmountReduced, VoucherAttested, VoucherClaimed, VoucherCreated, VoucherDisputed,
+    VoucherRefunded, VoucherSettled,
 };
 pub use interfaces::{ReceiptClient, RegistryClient};
 pub use types::{Config, DataKey, Voucher, VoucherError, VoucherStatus};
@@ -208,6 +208,88 @@ impl VoucherEscrow {
         }
         .publish(&env);
         Ok(id)
+    }
+
+    /// Gives back an overpayment without giving up the voucher.
+    ///
+    /// A funder who paid more than the listed price can bring the
+    /// escrowed amount down to the service price and keep the voucher.
+    /// The difference goes straight back to the funder, and no fee is
+    /// taken on money that never became care.
+    ///
+    /// The floor is the price the registry lists **at call time**, so a
+    /// clinic that has raised its price cannot have a funded voucher
+    /// reduced below that price, and a clinic that has lowered it frees
+    /// the funder to reduce further. Only a `Funded` voucher can be
+    /// reduced: once the clinic has claimed it, the escrowed amount is
+    /// what the clinic is expecting to be paid.
+    ///
+    /// Errors:
+    ///
+    /// - `NotAuthorized` — the caller is not the voucher's funder.
+    /// - `InvalidStatus` — the voucher is no longer `Funded`.
+    /// - `InvalidAmount` — `new_amount` is not positive.
+    /// - `AmountNotReduced` — `new_amount` is not below the escrowed amount.
+    /// - `ServiceNotOffered` — the service is no longer listed, so there is
+    ///   no price to reduce towards.
+    /// - `AmountBelowPrice` — `new_amount` is below the current listed price.
+    pub fn reduce_amount(
+        env: Env,
+        funder: Address,
+        voucher_id: u64,
+        new_amount: i128,
+    ) -> Result<(), VoucherError> {
+        funder.require_auth();
+
+        let mut voucher = read_voucher(&env, voucher_id)?;
+        if voucher.funder != funder {
+            return Err(VoucherError::NotAuthorized);
+        }
+        if voucher.status != VoucherStatus::Funded {
+            return Err(VoucherError::InvalidStatus);
+        }
+        if new_amount <= 0 {
+            return Err(VoucherError::InvalidAmount);
+        }
+        if new_amount >= voucher.amount {
+            return Err(VoucherError::AmountNotReduced);
+        }
+
+        let config = read_config(&env)?;
+        // The price at call time is the floor: whatever is left in escrow
+        // must still cover the service.
+        let price = RegistryClient::new(&env, &config.registry)
+            .get_service_price(&voucher.provider, &voucher.service_code);
+        if price == 0 {
+            // The service is no longer listed, so there is no price to
+            // reduce towards. The funder can still refund the voucher at
+            // expiry.
+            return Err(VoucherError::ServiceNotOffered);
+        }
+        if new_amount < price {
+            return Err(VoucherError::AmountBelowPrice);
+        }
+
+        let difference = voucher.amount - new_amount;
+        // Escrow first, record second: if the transfer fails the whole
+        // invocation reverts and the escrowed amount is unchanged.
+        let escrow = env.current_contract_address();
+        token::Client::new(&env, &config.token).transfer(&escrow, &funder, &difference);
+
+        let previous_amount = voucher.amount;
+        voucher.amount = new_amount;
+        write_voucher(&env, &voucher);
+
+        VoucherAmountReduced {
+            funder,
+            voucher_id,
+            service_code: voucher.service_code,
+            previous_amount,
+            amount: new_amount,
+            refunded: difference,
+        }
+        .publish(&env);
+        Ok(())
     }
 
     /// Provider marks the patient as presented and the service as begun.
