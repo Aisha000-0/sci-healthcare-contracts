@@ -14,6 +14,9 @@ use sci_registry::{ProviderStatus, Registry, RegistryClient, MIN_PRICE_NOTICE_SE
 
 const DISPUTE_WINDOW: u64 = 72 * 60 * 60; // 72 hours
 const FEE_BPS: u32 = 100; // 1%
+/// Half the protocol fee (50 of the 100 fee basis points) goes to the
+/// attester in the default fixture. `Fee account receives` tests allow for it.
+const ATTESTER_SHARE_BPS: u32 = 50;
 const START_TIME: u64 = 1_700_000_000;
 const CONSULT: u32 = 101;
 const CONSULT_PRICE: i128 = 30_000_000; // 3.00 USDC at 7 decimals
@@ -32,6 +35,10 @@ struct Fixture {
 }
 
 fn setup() -> Fixture {
+    setup_with(FEE_BPS, ATTESTER_SHARE_BPS)
+}
+
+fn setup_with(fee_bps: u32, attester_share_bps: u32) -> Fixture {
     let env = Env::default();
     env.mock_all_auths();
     env.ledger().with_mut(|li| li.timestamp = START_TIME);
@@ -71,7 +78,8 @@ fn setup() -> Fixture {
         &receipt_addr,
         &token_addr,
         &DISPUTE_WINDOW,
-        &FEE_BPS,
+        &fee_bps,
+        &attester_share_bps,
         &fee_account,
     );
 
@@ -416,11 +424,27 @@ fn full_lifecycle_pays_provider_and_mints_receipt() {
     f.voucher.settle(&id);
 
     let expected_fee = CONSULT_PRICE * FEE_BPS as i128 / 10_000;
+    let expected_attester_share = CONSULT_PRICE * ATTESTER_SHARE_BPS as i128 / 10_000;
     let expected_net = CONSULT_PRICE - expected_fee;
 
     assert_eq!(f.voucher.get_voucher(&id).status, VoucherStatus::Settled);
     assert_eq!(f.token.balance(&f.provider), expected_net);
-    assert_eq!(f.token.balance(&f.fee_account), expected_fee);
+    assert_eq!(f.token.balance(&f.attester), expected_attester_share);
+    assert_eq!(
+        f.token.balance(&f.fee_account),
+        expected_fee - expected_attester_share
+    );
+    assert_eq!(
+        expected_net + expected_attester_share + (expected_fee - expected_attester_share),
+        CONSULT_PRICE
+    );
+    assert_eq!(
+        f.token.balance(&f.provider)
+            + f.token.balance(&f.attester)
+            + f.token.balance(&f.fee_account),
+        CONSULT_PRICE
+    );
+    assert_eq!(f.token.balance(&f.voucher.address), 0);
 
     // Care receipt exists and carries no clinical data.
     let r = f.receipts.get_receipt(&id);
@@ -428,6 +452,74 @@ fn full_lifecycle_pays_provider_and_mints_receipt() {
     assert_eq!(r.service_code, CONSULT);
     assert_eq!(r.amount, CONSULT_PRICE);
     assert_eq!(f.receipts.count_for(&patient(&f.env)), 1);
+}
+
+#[test]
+fn attestation_stores_the_attester_on_the_voucher() {
+    let f = setup();
+    let id = fund(&f);
+
+    assert_eq!(f.voucher.get_voucher(&id).attester, None);
+    f.voucher.claim(&f.provider, &id);
+    f.voucher.attest(&f.attester, &id);
+
+    let voucher = f.voucher.get_voucher(&id);
+    assert_eq!(voucher.status, VoucherStatus::Attested);
+    assert_eq!(voucher.attester, Some(f.attester.clone()));
+}
+
+/// Funds, claims, attests and settles a fresh voucher.
+fn settle_fresh_voucher(f: &Fixture) -> u64 {
+    let id = fund(f);
+    f.voucher.claim(&f.provider, &id);
+    f.voucher.attest(&f.attester, &id);
+    advance(&f.env, DISPUTE_WINDOW + 1);
+    f.voucher.settle(&id);
+    id
+}
+
+#[test]
+fn settlement_splits_the_fee_between_attester_and_fee_account() {
+    // A quarter of the voucher amount is carved out of the 1% fee: 25 bps of
+    // the amount to the attester, 75 bps to the fee account.
+    let f = setup_with(FEE_BPS, 25);
+    let id = settle_fresh_voucher(&f);
+
+    let fee = CONSULT_PRICE * FEE_BPS as i128 / 10_000;
+    let attester_share = CONSULT_PRICE * 25 / 10_000;
+    let fee_account_share = fee - attester_share;
+    let net = CONSULT_PRICE - fee;
+
+    assert_eq!(f.token.balance(&f.provider), net);
+    assert_eq!(f.token.balance(&f.attester), attester_share);
+    assert_eq!(f.token.balance(&f.fee_account), fee_account_share);
+    assert_eq!(net + attester_share + fee_account_share, CONSULT_PRICE);
+    assert_eq!(f.token.balance(&f.voucher.address), 0);
+    assert_eq!(f.voucher.get_voucher(&id).status, VoucherStatus::Settled);
+}
+
+#[test]
+fn zero_attester_share_behaves_as_before() {
+    let f = setup_with(FEE_BPS, 0);
+    settle_fresh_voucher(&f);
+
+    let fee = CONSULT_PRICE * FEE_BPS as i128 / 10_000;
+    assert_eq!(f.token.balance(&f.provider), CONSULT_PRICE - fee);
+    assert_eq!(f.token.balance(&f.attester), 0);
+    assert_eq!(f.token.balance(&f.fee_account), fee);
+    assert_eq!(f.token.balance(&f.voucher.address), 0);
+}
+
+#[test]
+fn attester_share_equal_to_the_fee_pays_it_all_to_the_attester() {
+    let f = setup_with(FEE_BPS, FEE_BPS);
+    settle_fresh_voucher(&f);
+
+    let fee = CONSULT_PRICE * FEE_BPS as i128 / 10_000;
+    assert_eq!(f.token.balance(&f.provider), CONSULT_PRICE - fee);
+    assert_eq!(f.token.balance(&f.attester), fee);
+    assert_eq!(f.token.balance(&f.fee_account), 0);
+    assert_eq!(f.token.balance(&f.voucher.address), 0);
 }
 
 #[test]
@@ -443,7 +535,10 @@ fn quote_matches_settlement() {
     f.voucher.settle(&id);
 
     assert_eq!(f.token.balance(&f.provider), net);
-    assert_eq!(f.token.balance(&f.fee_account), fee);
+    let attester_share = CONSULT_PRICE * ATTESTER_SHARE_BPS as i128 / 10_000;
+    assert_eq!(f.token.balance(&f.attester), attester_share);
+    assert_eq!(f.token.balance(&f.fee_account), fee - attester_share);
+    assert_eq!(f.token.balance(&f.voucher.address), 0);
 }
 
 #[test]
@@ -484,6 +579,7 @@ fn quote_equals_settlement_for_every_amount() {
         );
 
         let (fee, net) = f.voucher.quote(&amount);
+        let attester_share = amount * ATTESTER_SHARE_BPS as i128 / 10_000;
         assert_eq!(fee + net, amount, "quote does not add up for {amount}");
         assert_eq!(
             fee,
@@ -494,6 +590,10 @@ fn quote_equals_settlement_for_every_amount() {
             net,
             amount - fee,
             "net is not amount minus fee for {amount}"
+        );
+        assert!(
+            attester_share <= fee,
+            "attester share exceeds the fee for {amount}"
         );
 
         let funder_before = f.token.balance(&f.funder);
@@ -521,9 +621,21 @@ fn quote_equals_settlement_for_every_amount() {
             "provider received a different net than quoted for {amount}"
         );
         assert_eq!(
+            f.token.balance(&f.attester),
+            attester_share,
+            "attester received a different share than documented for {amount}"
+        );
+        assert_eq!(
             f.token.balance(&f.fee_account),
-            fee,
+            fee - attester_share,
             "fee account received a different fee than quoted for {amount}"
+        );
+        assert_eq!(
+            f.token.balance(&f.provider)
+                + f.token.balance(&f.attester)
+                + f.token.balance(&f.fee_account),
+            amount,
+            "settlement payouts do not sum to the voucher amount for {amount}"
         );
         assert_eq!(
             f.token.balance(&f.voucher.address),
@@ -958,6 +1070,10 @@ fn resolving_for_provider_pays_out() {
 
     let expected_fee = CONSULT_PRICE * FEE_BPS as i128 / 10_000;
     assert_eq!(f.token.balance(&f.provider), CONSULT_PRICE - expected_fee);
+    // No attestation happened, so there is no attester of record to pay and
+    // the fee account keeps the whole fee.
+    assert_eq!(f.token.balance(&f.attester), 0);
+    assert_eq!(f.token.balance(&f.fee_account), expected_fee);
     assert_eq!(f.voucher.get_voucher(&id).status, VoucherStatus::Settled);
     // A settled dispute still produces a care receipt.
     assert_eq!(f.receipts.count_for(&patient(&f.env)), 1);
@@ -1138,7 +1254,16 @@ fn initialize_is_single_shot() {
     let a = Address::generate(&f.env);
     let err = f
         .voucher
-        .try_initialize(&a, &a, &a, &a, &DISPUTE_WINDOW, &FEE_BPS, &a)
+        .try_initialize(
+            &a,
+            &a,
+            &a,
+            &a,
+            &DISPUTE_WINDOW,
+            &FEE_BPS,
+            &ATTESTER_SHARE_BPS,
+            &a,
+        )
         .err()
         .unwrap()
         .unwrap();
@@ -1154,11 +1279,38 @@ fn excessive_fee_rejected_at_init() {
     let client = VoucherEscrowClient::new(&env, &addr);
 
     let err = client
-        .try_initialize(&a, &a, &a, &a, &DISPUTE_WINDOW, &1_001u32, &a)
+        .try_initialize(&a, &a, &a, &a, &DISPUTE_WINDOW, &1_001u32, &0u32, &a)
         .err()
         .unwrap()
         .unwrap();
     assert_eq!(err, VoucherError::InvalidFee);
+}
+
+#[test]
+fn excessive_attester_share_rejected_at_init() {
+    // The attester share is carved out of the fee, so a share above the fee
+    // would pay out more than was charged.
+    let env = Env::default();
+    env.mock_all_auths();
+    let a = Address::generate(&env);
+    let addr = env.register(VoucherEscrow, ());
+    let client = VoucherEscrowClient::new(&env, &addr);
+
+    let err = client
+        .try_initialize(
+            &a,
+            &a,
+            &a,
+            &a,
+            &DISPUTE_WINDOW,
+            &FEE_BPS,
+            &(FEE_BPS + 1),
+            &a,
+        )
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VoucherError::InvalidAttesterShare);
 }
 
 #[test]
@@ -1678,13 +1830,25 @@ fn settle_event_snapshot_carries_service_and_amount() {
     assert_eq!(field_i128(&e, "net"), net);
     assert_eq!(field_i128(&e, "fee"), fee);
     // The gross escrow sits beside the payout, so one event answers both
-    // "what was paid" and "what landed".
+    // "what was paid" and "what landed". The attester's slice is part of the
+    // fee, not an extra charge on the clinic.
     assert_eq!(field_i128(&e, "net") + field_i128(&e, "fee"), CONSULT_PRICE);
+    assert_eq!(
+        field_i128(&e, "attester_share"),
+        CONSULT_PRICE * ATTESTER_SHARE_BPS as i128 / 10_000
+    );
     assert_eq!(field_u32(&e, "service_code"), CONSULT);
     assert_eq!(field_i128(&e, "amount"), CONSULT_PRICE);
     assert_eq!(
         field_names(&e),
-        ["amount", "fee", "net", "service_code", "voucher_id"],
+        [
+            "amount",
+            "attester_share",
+            "fee",
+            "net",
+            "service_code",
+            "voucher_id",
+        ],
     );
 }
 
@@ -1924,6 +2088,7 @@ fn run_case(f: &AuthFixture, function: &str) -> std::vec::Vec<Address> {
                 &a,
                 &DISPUTE_WINDOW,
                 &FEE_BPS,
+                &ATTESTER_SHARE_BPS,
                 &a,
             );
             return recorded_auths(&env);
@@ -2279,6 +2444,10 @@ fn contract_instance_survives_sixty_days_of_writes() {
     }
 
     assert_eq!(f.voucher.get_config().fee_bps, FEE_BPS);
+    assert_eq!(
+        f.voucher.get_config().attester_share_bps,
+        ATTESTER_SHARE_BPS
+    );
 }
 
 #[test]
@@ -2371,6 +2540,7 @@ fn initialized_event_snapshot() {
         &a,
         &DISPUTE_WINDOW,
         &FEE_BPS,
+        &ATTESTER_SHARE_BPS,
         &a,
     );
 
@@ -2640,6 +2810,7 @@ fn math_overflow_in_fee_calculation() {
         &token_addr,
         &DISPUTE_WINDOW,
         &1_000u32,
+        &0u32,
         &fee_account,
     );
 

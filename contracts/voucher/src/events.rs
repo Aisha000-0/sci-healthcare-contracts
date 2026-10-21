@@ -82,6 +82,9 @@ pub struct VoucherSettled {
     /// beside the `net` and `fee` that were paid out.
     pub service_code: u32,
     pub amount: i128,
+    /// Appended: the part of `fee` routed to the attester. The fee account
+    /// received `fee - attester_share`, so `net + fee == amount`.
+    pub attester_share: i128,
 }
 
 #[contractevent]
