@@ -923,6 +923,133 @@ fn cannot_resolve_undisputed_voucher() {
     assert_eq!(err, VoucherError::InvalidStatus);
 }
 
+#[test]
+fn split_zero_refunds_funder_in_full_without_a_receipt() {
+    let f = setup();
+    let before = f.token.balance(&f.funder);
+    let id = fund(&f);
+    f.voucher.claim(&f.provider, &id);
+    f.voucher.dispute(&f.funder, &id, &1u32);
+
+    f.voucher.resolve_split(&f.admin, &id, &0i128);
+
+    assert_eq!(f.token.balance(&f.funder), before);
+    assert_eq!(f.token.balance(&f.provider), 0);
+    assert_eq!(f.token.balance(&f.fee_account), 0);
+    assert_eq!(f.token.balance(&f.voucher.address), 0);
+    assert_eq!(f.voucher.get_voucher(&id).status, VoucherStatus::Refunded);
+    // Care did not happen, so the beneficiary has no care receipt.
+    assert_eq!(f.receipts.count_for(&patient(&f.env)), 0);
+}
+
+#[test]
+fn split_half_pays_clinic_fee_and_funder_exactly() {
+    let f = setup();
+    let before = f.token.balance(&f.funder);
+    let id = fund(&f);
+    f.voucher.claim(&f.provider, &id);
+    f.voucher.dispute(&f.funder, &id, &1u32);
+
+    let to_provider = CONSULT_PRICE / 2;
+    let to_funder = CONSULT_PRICE - to_provider;
+    let fee = to_provider * FEE_BPS as i128 / 10_000;
+    let net = to_provider - fee;
+
+    f.voucher.resolve_split(&f.admin, &id, &to_provider);
+
+    assert_eq!(f.token.balance(&f.provider), net);
+    assert_eq!(f.token.balance(&f.fee_account), fee);
+    assert_eq!(f.token.balance(&f.funder), before - to_provider);
+    assert_eq!(f.token.balance(&f.voucher.address), 0);
+    assert_eq!(net + fee + to_funder, CONSULT_PRICE);
+    assert_eq!(f.voucher.get_voucher(&id).status, VoucherStatus::Settled);
+
+    let r = f.receipts.get_receipt(&id);
+    assert_eq!(r.provider, f.provider);
+    assert_eq!(r.service_code, CONSULT);
+    assert_eq!(r.amount, to_provider);
+    assert_eq!(f.receipts.count_for(&patient(&f.env)), 1);
+}
+
+#[test]
+fn split_full_amount_matches_a_full_payout() {
+    let f = setup();
+    let before = f.token.balance(&f.funder);
+    let id = fund(&f);
+    f.voucher.claim(&f.provider, &id);
+    f.voucher.dispute(&f.funder, &id, &1u32);
+
+    let fee = CONSULT_PRICE * FEE_BPS as i128 / 10_000;
+    let net = CONSULT_PRICE - fee;
+
+    f.voucher.resolve_split(&f.admin, &id, &CONSULT_PRICE);
+
+    assert_eq!(f.token.balance(&f.provider), net);
+    assert_eq!(f.token.balance(&f.fee_account), fee);
+    // The funder paid the voucher at funding time and gets nothing back.
+    assert_eq!(f.token.balance(&f.funder), before - CONSULT_PRICE);
+    assert_eq!(f.token.balance(&f.voucher.address), 0);
+    assert_eq!(f.voucher.get_voucher(&id).status, VoucherStatus::Settled);
+
+    let r = f.receipts.get_receipt(&id);
+    assert_eq!(r.amount, CONSULT_PRICE);
+    assert_eq!(f.receipts.count_for(&patient(&f.env)), 1);
+}
+
+#[test]
+fn split_rejects_an_amount_outside_the_voucher() {
+    let f = setup();
+    let id = fund(&f);
+    f.voucher.claim(&f.provider, &id);
+    f.voucher.dispute(&f.funder, &id, &1u32);
+
+    for bad in [-1i128, CONSULT_PRICE + 1] {
+        let err = f
+            .voucher
+            .try_resolve_split(&f.admin, &id, &bad)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, VoucherError::InvalidAmount);
+    }
+
+    // Nothing moved and the dispute is still open.
+    assert_eq!(f.token.balance(&f.provider), 0);
+    assert_eq!(f.token.balance(&f.fee_account), 0);
+    assert_eq!(f.voucher.get_voucher(&id).status, VoucherStatus::Disputed);
+}
+
+#[test]
+fn non_admin_cannot_resolve_split() {
+    let f = setup();
+    let id = fund(&f);
+    f.voucher.claim(&f.provider, &id);
+    f.voucher.dispute(&f.funder, &id, &1u32);
+    let impostor = Address::generate(&f.env);
+
+    let err = f
+        .voucher
+        .try_resolve_split(&impostor, &id, &(CONSULT_PRICE / 2))
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VoucherError::NotAuthorized);
+}
+
+#[test]
+fn cannot_split_an_undisputed_voucher() {
+    let f = setup();
+    let id = fund(&f);
+
+    let err = f
+        .voucher
+        .try_resolve_split(&f.admin, &id, &0i128)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VoucherError::InvalidStatus);
+}
+
 // ----- config -----
 
 #[test]
@@ -1639,6 +1766,10 @@ const AUTH_MATRIX: &[AuthCase] = &[
         auth: signer("`admin`", admin_addr),
     },
     AuthCase {
+        function: "resolve_split",
+        auth: signer("`admin`", admin_addr),
+    },
+    AuthCase {
         function: "set_attestation_cap",
         auth: signer("`admin`", admin_addr),
     },
@@ -1756,6 +1887,12 @@ fn run_case(f: &AuthFixture, function: &str) -> std::vec::Vec<Address> {
             voucher.claim(&f.f.provider, &id);
             voucher.dispute(&f.f.funder, &id, &1u32);
             voucher.resolve_dispute(&f.f.admin, &id, &true);
+        }
+        "resolve_split" => {
+            let id = fund(&f.f);
+            voucher.claim(&f.f.provider, &id);
+            voucher.dispute(&f.f.funder, &id, &1u32);
+            voucher.resolve_split(&f.f.admin, &id, &(CONSULT_PRICE / 2));
         }
         "set_attestation_cap" => {
             voucher.set_attestation_cap(&f.f.admin, &10);
@@ -2227,10 +2364,68 @@ fn dispute_resolved_event_snapshot() {
         &e,
         "dispute_resolved",
         &[ScVal::from(&f.admin)],
-        &["voucher_id", "refunded_funder"],
+        &[
+            "voucher_id",
+            "refunded_funder",
+            "to_provider",
+            "fee",
+            "to_funder",
+        ],
     );
     assert_eq!(field_u64(&e, "voucher_id"), id);
     assert!(field_bool(&e, "refunded_funder"));
+    assert_eq!(field_i128(&e, "to_provider"), 0);
+    assert_eq!(field_i128(&e, "fee"), 0);
+    assert_eq!(field_i128(&e, "to_funder"), CONSULT_PRICE);
+}
+
+#[test]
+fn split_dispute_resolved_event_snapshot() {
+    let f = setup();
+    let id = fund(&f);
+    f.voucher.claim(&f.provider, &id);
+    f.voucher.dispute(&f.funder, &id, &1u32);
+
+    let to_provider = CONSULT_PRICE / 2;
+    let fee = to_provider * FEE_BPS as i128 / 10_000;
+    f.voucher.resolve_split(&f.admin, &id, &to_provider);
+
+    // Splitting also mints a receipt, and that contract publishes its own
+    // event in the same invocation; pick the voucher's event out by name.
+    let events = f.env.events().all().filter_by_contract(&f.voucher.address);
+    let list = events.events();
+    let resolved: std::vec::Vec<ContractEvent> = list
+        .iter()
+        .filter(|e| symbol(&topics(e)[0]) == Some("dispute_resolved"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        resolved.len(),
+        1,
+        "splitting a dispute publishes exactly one dispute_resolved event",
+    );
+    let e = resolved[0].clone();
+    assert_layout(
+        &e,
+        "dispute_resolved",
+        &[ScVal::from(&f.admin)],
+        &[
+            "voucher_id",
+            "refunded_funder",
+            "to_provider",
+            "fee",
+            "to_funder",
+        ],
+    );
+    assert_eq!(field_u64(&e, "voucher_id"), id);
+    assert!(!field_bool(&e, "refunded_funder"));
+    assert_eq!(field_i128(&e, "to_provider"), to_provider);
+    assert_eq!(field_i128(&e, "fee"), fee);
+    assert_eq!(field_i128(&e, "to_funder"), CONSULT_PRICE - to_provider);
+    assert_eq!(
+        field_i128(&e, "to_provider") + field_i128(&e, "to_funder"),
+        CONSULT_PRICE
+    );
 }
 
 #[test]

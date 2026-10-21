@@ -415,10 +415,15 @@ impl VoucherEscrow {
             return Err(VoucherError::InvalidStatus);
         }
 
+        let to_provider = if refund_funder { 0 } else { voucher.amount };
+        let fee = Self::fee_for(to_provider, config.fee_bps)?;
         DisputeResolved {
             admin,
             voucher_id,
             refunded_funder: refund_funder,
+            to_provider,
+            fee,
+            to_funder: voucher.amount - to_provider,
         }
         .publish(&env);
 
@@ -427,6 +432,55 @@ impl VoucherEscrow {
         } else {
             Self::pay_out(&env, &config, &mut voucher)?;
         }
+        Ok(())
+    }
+
+    /// Admin resolves a dispute by splitting the escrow between the parties.
+    ///
+    /// `to_provider` is the gross part of the voucher awarded to the clinic,
+    /// from `0` to the voucher amount. The clinic receives `to_provider` minus
+    /// the protocol fee on that part, the fee account receives the fee, and the
+    /// funder receives the rest. The three amounts add up to the voucher amount
+    /// exactly, whatever `to_provider` is.
+    ///
+    /// A split of `0` is a full refund and a split of the whole amount is a
+    /// full payout; in between, the voucher ends `Settled` because some care
+    /// was paid for. A care receipt is minted only when the clinic receives
+    /// something, so no receipt exists for a split that refunds everything.
+    ///
+    /// Like `resolve_dispute`, this is a trusted admin decision, but it can
+    /// still route escrow only to the clinic, the fee account and the funder.
+    pub fn resolve_split(
+        env: Env,
+        admin: Address,
+        voucher_id: u64,
+        to_provider: i128,
+    ) -> Result<(), VoucherError> {
+        let config = read_config(&env)?;
+        common::require_admin(&config.admin, &admin)?;
+
+        let mut voucher = read_voucher(&env, voucher_id)?;
+        if voucher.status != VoucherStatus::Disputed {
+            return Err(VoucherError::InvalidStatus);
+        }
+        if to_provider < 0 || to_provider > voucher.amount {
+            return Err(VoucherError::InvalidAmount);
+        }
+
+        let fee = Self::fee_for(to_provider, config.fee_bps)?;
+        let to_funder = voucher.amount - to_provider;
+
+        DisputeResolved {
+            admin,
+            voucher_id,
+            refunded_funder: to_provider == 0,
+            to_provider,
+            fee,
+            to_funder,
+        }
+        .publish(&env);
+
+        Self::pay_split(&env, &config, &mut voucher, to_provider, fee, to_funder);
         Ok(())
     }
 
@@ -611,6 +665,52 @@ impl VoucherEscrow {
         }
         .publish(env);
         Ok(())
+    }
+
+    /// Pays a resolved dispute in parts: `to_provider` gross to the clinic
+    /// (minus its fee), the fee to the fee account and `to_funder` back to the
+    /// funder. The caller has already checked that the parts add up.
+    fn pay_split(
+        env: &Env,
+        config: &Config,
+        voucher: &mut Voucher,
+        to_provider: i128,
+        fee: i128,
+        to_funder: i128,
+    ) {
+        let net = to_provider - fee;
+        let token_client = token::Client::new(env, &config.token);
+        let escrow = env.current_contract_address();
+
+        if net > 0 {
+            token_client.transfer(&escrow, &voucher.provider, &net);
+        }
+        if fee > 0 {
+            token_client.transfer(&escrow, &config.fee_account, &fee);
+        }
+        if to_funder > 0 {
+            token_client.transfer(&escrow, &voucher.funder, &to_funder);
+        }
+
+        voucher.status = if to_provider == 0 {
+            VoucherStatus::Refunded
+        } else {
+            VoucherStatus::Settled
+        };
+        write_voucher(env, voucher);
+
+        // No care was paid for when the split sends everything back, so no
+        // receipt is minted and the beneficiary's episode count stays put.
+        if to_provider > 0 {
+            ReceiptClient::new(env, &config.receipt_book).mint(
+                &escrow,
+                &voucher.id,
+                &voucher.beneficiary_ref,
+                &voucher.provider,
+                &voucher.service_code,
+                &to_provider,
+            );
+        }
     }
 
     /// Returns the full escrowed amount to the funder. No fee is taken on

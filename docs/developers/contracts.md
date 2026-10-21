@@ -173,6 +173,7 @@ pub struct Voucher {
 | `settle` | `voucher_id` | `()` | **none** |
 | `refund` | `voucher_id` | `()` | **none** |
 | `resolve_dispute` | `admin, voucher_id, refund_funder: bool` | `()` | `admin` |
+| `resolve_split` | `admin, voucher_id, to_provider: i128` | `()` | `admin` |
 | `set_attestation_cap` | `admin, cap: u32` | `()` | `admin` |
 | `propose_admin` | `admin, new_admin` | `()` | `admin` |
 | `accept_admin` | `new_admin` | `()` | `new_admin` |
@@ -204,6 +205,7 @@ Every public function, with the exact signer it demands. `AUTH_MATRIX` in `contr
 | `settle` | none (permissionless) |
 | `refund` | none (permissionless) |
 | `resolve_dispute` | `admin` |
+| `resolve_split` | `admin` |
 | `set_attestation_cap` | `admin` |
 | `propose_admin` | `admin` |
 | `accept_admin` | `new_admin` |
@@ -242,6 +244,8 @@ rejects the voucher's own provider even if it holds that role.
 
 **`resolve_dispute`** — caller is admin; status is `Disputed`. Routes to funder or provider; no third destination exists.
 
+**`resolve_split`** — caller is admin; status is `Disputed`; `0 ≤ to_provider ≤ amount`, else `InvalidAmount`. Pays `to_provider - fee(to_provider)` to the clinic, the fee on that part to the fee account, and `amount - to_provider` back to the funder. The parts sum to the voucher amount exactly, and the escrow is empty afterwards. A receipt is minted for `to_provider` only when it is greater than zero. A split of `0` ends `Refunded`; any larger split ends `Settled`. Like `resolve_dispute`, the admin can send escrow only to the clinic, the fee account and the funder.
+
 ### Errors
 
 | # | Variant | # | Variant |
@@ -269,7 +273,7 @@ rejects the voucher's own provider even if it holds that role.
 | `voucher_disputed` | `funder` | `voucher_id`, `reason_code`, `service_code`, `amount` |
 | `voucher_settled` | `provider` | `voucher_id`, `net`, `fee`, `service_code`, `amount` |
 | `voucher_refunded` | `funder` | `voucher_id`, `amount`, `service_code` |
-| `dispute_resolved` | `admin` | `voucher_id`, `refunded_funder` |
+| `dispute_resolved` | `admin` | `voucher_id`, `refunded_funder`, `to_provider`, `fee`, `to_funder` |
 | `attestation_cap_changed` | `admin` | `cap` |
 
 > Fields listed under **Topics** are published in the event's topic list, **not** in its data map. An indexer reading them off the data map gets `undefined`.
