@@ -44,7 +44,7 @@ The grace period exists so that a claim on its own can never hold the funder's m
 
 ### Attested
 
-An attester has confirmed the care was delivered. This starts the dispute window — 72 hours in the production configuration.
+An attester has confirmed the care was delivered. This starts the dispute window — 72 hours in the production configuration. The voucher records that attester, because settlement pays them a share of the protocol fee.
 
 The contract refuses this call from the clinic that is going to be paid.
 
@@ -52,7 +52,7 @@ The contract refuses this call from the clinic that is going to be paid.
 
 ### Settled
 
-The dispute window closed and `settle` ran. The clinic received the amount less the protocol fee, the fee went to the fee account, and a care receipt was minted.
+The dispute window closed and `settle` ran. The clinic received the amount less the protocol fee, the attester received its configured share of the fee, the rest of the fee went to the fee account, and a care receipt was minted. The clinic's net is the same whether or not an attester share is configured, and the three payouts sum exactly to the voucher amount.
 
 `settle` takes no authorisation. This is deliberate: a clinic that has delivered care and been attested should never have to chase the funder, or us, to be paid.
 
@@ -74,6 +74,50 @@ New codes may be added. Existing codes are never renumbered.
 ### Refunded
 
 The voucher expired unclaimed, the clinic was no longer active before it could be claimed, it was claimed but never attested within the grace period, or a dispute was resolved in the funder's favour. The **full** amount goes back — no fee is taken on care that did not happen.
+
+## The dispute sequence
+
+Everyone in a dispute has a fixed part to play, and only the admin can move the money once it is disputed:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Funder
+    participant Clinic
+    actor Attester
+    participant Voucher as Voucher contract
+    actor Admin
+
+    Funder->>Voucher: create_voucher(funder, beneficiary_ref, provider, service_code, amount, expires_at)
+    Voucher-->>Funder: voucher_id (Funded)
+
+    Clinic->>Voucher: claim(provider, voucher_id)
+    Voucher-->>Clinic: Claimed
+
+    Attester->>Voucher: attest(attester, voucher_id)
+    Voucher-->>Funder: VoucherAttested (72-hour dispute window opens)
+
+    alt Funder disputes in time
+        Funder->>Voucher: dispute(funder, voucher_id, reason_code)
+        Voucher-->>Funder: Disputed (funds stay in escrow)
+        Note over Voucher: Only the admin can move the money now,<br/>and only to the funder or the clinic.
+        Admin->>Voucher: resolve_dispute(admin, voucher_id, refund_funder)
+        alt refund_funder = true
+            Voucher-->>Funder: VoucherRefunded (full amount, no fee)
+        else refund_funder = false
+            Voucher-->>Clinic: VoucherSettled (amount less fee)
+            Voucher->>Voucher: mint care receipt
+        end
+    else Window closes with no dispute
+        Note over Funder,Voucher: settle is permissionless
+        Voucher-->>Clinic: VoucherSettled (amount less fee)
+        Voucher->>Voucher: mint care receipt
+    end
+```
+
+A funder may also open a dispute straight after `claim`, before any attestation: `dispute` accepts a voucher in `Claimed`. The same sequence then applies, with the admin resolving it.
+
+If the clinic claims but no attester ever confirms delivery, the dispute window never opens. Instead, `refund` lets anyone return the full amount to the funder once the voucher is seven days past its expiry (`CLAIM_GRACE_SECS`). The clinic cannot keep the money by staying silent.
 
 ## A worked example
 

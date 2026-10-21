@@ -60,9 +60,9 @@ pub use interfaces::{ReceiptClient, RegistryClient};
 pub use types::{Config, DataKey, Voucher, VoucherError, VoucherStatus};
 
 use storage::{
-    bump_next_id, extend_instance, has_config, peek_next_id, read_attestation_cap,
-    read_attestations, read_config, read_voucher, write_attestation_cap, write_attestations,
-    write_config, write_voucher,
+    bump_next_id, decrease_open_escrow, extend_instance, has_config, increase_open_escrow,
+    peek_next_id, read_attestation_cap, read_attestations, read_config, read_open_escrow,
+    read_voucher, write_attestation_cap, write_attestations, write_config, write_voucher,
 };
 
 const BPS_DENOMINATOR: i128 = 10_000;
@@ -102,6 +102,7 @@ impl VoucherEscrow {
         token: Address,
         dispute_window: u64,
         fee_bps: u32,
+        attester_share_bps: u32,
         fee_account: Address,
     ) -> Result<(), VoucherError> {
         if has_config(&env) {
@@ -109,6 +110,11 @@ impl VoucherEscrow {
         }
         if fee_bps > MAX_FEE_BPS {
             return Err(VoucherError::InvalidFee);
+        }
+        // The attester's share is carved out of the protocol fee, so it can
+        // never be larger than the fee itself.
+        if attester_share_bps > fee_bps {
+            return Err(VoucherError::InvalidAttesterShare);
         }
 
         write_config(
@@ -120,6 +126,7 @@ impl VoucherEscrow {
                 token,
                 dispute_window,
                 fee_bps,
+                attester_share_bps,
                 fee_account,
             },
         );
@@ -178,6 +185,7 @@ impl VoucherEscrow {
         let escrow = env.current_contract_address();
         let token_client = token::Client::new(&env, &config.token);
         token_client.transfer(&funder, &escrow, &amount);
+        increase_open_escrow(&env, amount)?;
 
         let id = bump_next_id(&env);
         let voucher = Voucher {
@@ -193,6 +201,7 @@ impl VoucherEscrow {
             claimed_at: 0,
             attested_at: 0,
             dispute_deadline: 0,
+            attester: None,
         };
         write_voucher(&env, &voucher);
 
@@ -275,6 +284,8 @@ impl VoucherEscrow {
         // invocation reverts and the escrowed amount is unchanged.
         let escrow = env.current_contract_address();
         token::Client::new(&env, &config.token).transfer(&escrow, &funder, &difference);
+        // The difference has left escrow, so the running total follows it.
+        decrease_open_escrow(&env, difference)?;
 
         let previous_amount = voucher.amount;
         voucher.amount = new_amount;
@@ -371,6 +382,7 @@ impl VoucherEscrow {
 
         voucher.status = VoucherStatus::Attested;
         voucher.attested_at = now;
+        voucher.attester = Some(attester.clone());
         voucher.dispute_deadline = now
             .checked_add(config.dispute_window)
             .ok_or(VoucherError::MathOverflow)?;
@@ -473,7 +485,7 @@ impl VoucherEscrow {
             return Err(VoucherError::NotYetExpired);
         }
 
-        Self::pay_back(&env, &config, &mut voucher);
+        Self::pay_back(&env, &config, &mut voucher)?;
         Ok(())
     }
 
@@ -497,18 +509,72 @@ impl VoucherEscrow {
             return Err(VoucherError::InvalidStatus);
         }
 
+        let to_provider = if refund_funder { 0 } else { voucher.amount };
+        let fee = Self::fee_for(to_provider, config.fee_bps)?;
         DisputeResolved {
             admin,
             voucher_id,
             refunded_funder: refund_funder,
+            to_provider,
+            fee,
+            to_funder: voucher.amount - to_provider,
         }
         .publish(&env);
 
         if refund_funder {
-            Self::pay_back(&env, &config, &mut voucher);
+            Self::pay_back(&env, &config, &mut voucher)?;
         } else {
             Self::pay_out(&env, &config, &mut voucher)?;
         }
+        Ok(())
+    }
+
+    /// Admin resolves a dispute by splitting the escrow between the parties.
+    ///
+    /// `to_provider` is the gross part of the voucher awarded to the clinic,
+    /// from `0` to the voucher amount. The clinic receives `to_provider` minus
+    /// the protocol fee on that part, the fee account receives the fee, and the
+    /// funder receives the rest. The three amounts add up to the voucher amount
+    /// exactly, whatever `to_provider` is.
+    ///
+    /// A split of `0` is a full refund and a split of the whole amount is a
+    /// full payout; in between, the voucher ends `Settled` because some care
+    /// was paid for. A care receipt is minted only when the clinic receives
+    /// something, so no receipt exists for a split that refunds everything.
+    ///
+    /// Like `resolve_dispute`, this is a trusted admin decision, but it can
+    /// still route escrow only to the clinic, the fee account and the funder.
+    pub fn resolve_split(
+        env: Env,
+        admin: Address,
+        voucher_id: u64,
+        to_provider: i128,
+    ) -> Result<(), VoucherError> {
+        let config = read_config(&env)?;
+        common::require_admin(&config.admin, &admin)?;
+
+        let mut voucher = read_voucher(&env, voucher_id)?;
+        if voucher.status != VoucherStatus::Disputed {
+            return Err(VoucherError::InvalidStatus);
+        }
+        if to_provider < 0 || to_provider > voucher.amount {
+            return Err(VoucherError::InvalidAmount);
+        }
+
+        let fee = Self::fee_for(to_provider, config.fee_bps)?;
+        let to_funder = voucher.amount - to_provider;
+
+        DisputeResolved {
+            admin,
+            voucher_id,
+            refunded_funder: to_provider == 0,
+            to_provider,
+            fee,
+            to_funder,
+        }
+        .publish(&env);
+
+        Self::pay_split(&env, &config, &mut voucher, to_provider, fee, to_funder);
         Ok(())
     }
 
@@ -607,6 +673,23 @@ impl VoucherEscrow {
         Ok((fee, amount - fee))
     }
 
+    /// Read-only solvency check: `(open_escrow, token_balance)`.
+    ///
+    /// `open_escrow` is the running total of amounts belonging to vouchers
+    /// that have been funded and not yet settled or refunded. `token_balance`
+    /// is the contract's actual balance of the settlement token. The two are
+    /// equal when the accounting is correct; anything else is a bug or tokens
+    /// sent to the contract outside a voucher.
+    ///
+    /// No authorisation: anyone may run the check.
+    pub fn escrow_summary(env: Env) -> Result<(i128, i128), VoucherError> {
+        let config = read_config(&env)?;
+        let open_escrow = read_open_escrow(&env);
+        let token_balance =
+            token::Client::new(&env, &config.token).balance(&env.current_contract_address());
+        Ok((open_escrow, token_balance))
+    }
+
     /// Crate version this contract was built from, e.g. `"0.2.0"`.
     ///
     /// Lets integrators and the indexer tell deployments apart without
@@ -651,25 +734,55 @@ impl VoucherEscrow {
     /// Basis-point fee. Integer math throughout; truncation favours the
     /// provider, never the protocol.
     fn fee_for(amount: i128, fee_bps: u32) -> Result<i128, VoucherError> {
+        Self::bps_of(amount, fee_bps)
+    }
+
+    /// Share of `amount` in basis points, rounded down.
+    fn bps_of(amount: i128, bps: u32) -> Result<i128, VoucherError> {
         amount
-            .checked_mul(fee_bps as i128)
+            .checked_mul(bps as i128)
             .ok_or(VoucherError::MathOverflow)?
             .checked_div(BPS_DENOMINATOR)
             .ok_or(VoucherError::MathOverflow)
     }
 
-    /// Pays the provider, takes the fee, and mints the care receipt.
+    /// Pays the provider, splits the fee between the attester and the fee
+    /// account, and mints the care receipt.
+    ///
+    /// `Config` guarantees `attester_share_bps <= fee_bps`, so the attester
+    /// share can never exceed the fee and the three payouts always sum to the
+    /// voucher amount exactly:
+    ///
+    /// ```text
+    /// net             = amount - fee
+    /// attester_share  = amount * attester_share_bps / 10_000
+    /// fee_account     = fee - attester_share
+    /// ```
+    ///
+    /// A voucher attested before attesters were stored has no attester to pay,
+    /// so the whole fee goes to the fee account, as it did before.
     fn pay_out(env: &Env, config: &Config, voucher: &mut Voucher) -> Result<(), VoucherError> {
         let fee = Self::fee_for(voucher.amount, config.fee_bps)?;
         let net = voucher.amount - fee;
+        let attester_share = match &voucher.attester {
+            Some(_) => Self::bps_of(voucher.amount, config.attester_share_bps)?,
+            None => 0,
+        };
+        let fee_account_share = fee - attester_share;
 
         let token_client = token::Client::new(env, &config.token);
         let escrow = env.current_contract_address();
 
         token_client.transfer(&escrow, &voucher.provider, &net);
-        if fee > 0 {
-            token_client.transfer(&escrow, &config.fee_account, &fee);
+        if let Some(attester) = &voucher.attester {
+            if attester_share > 0 {
+                token_client.transfer(&escrow, attester, &attester_share);
+            }
         }
+        if fee_account_share > 0 {
+            token_client.transfer(&escrow, &config.fee_account, &fee_account_share);
+        }
+        decrease_open_escrow(env, voucher.amount)?;
 
         voucher.status = VoucherStatus::Settled;
         write_voucher(env, voucher);
@@ -688,6 +801,7 @@ impl VoucherEscrow {
             voucher_id: voucher.id,
             net,
             fee,
+            attester_share,
             service_code: voucher.service_code,
             amount: voucher.amount,
         }
@@ -695,14 +809,61 @@ impl VoucherEscrow {
         Ok(())
     }
 
+    /// Pays a resolved dispute in parts: `to_provider` gross to the clinic
+    /// (minus its fee), the fee to the fee account and `to_funder` back to the
+    /// funder. The caller has already checked that the parts add up.
+    fn pay_split(
+        env: &Env,
+        config: &Config,
+        voucher: &mut Voucher,
+        to_provider: i128,
+        fee: i128,
+        to_funder: i128,
+    ) {
+        let net = to_provider - fee;
+        let token_client = token::Client::new(env, &config.token);
+        let escrow = env.current_contract_address();
+
+        if net > 0 {
+            token_client.transfer(&escrow, &voucher.provider, &net);
+        }
+        if fee > 0 {
+            token_client.transfer(&escrow, &config.fee_account, &fee);
+        }
+        if to_funder > 0 {
+            token_client.transfer(&escrow, &voucher.funder, &to_funder);
+        }
+
+        voucher.status = if to_provider == 0 {
+            VoucherStatus::Refunded
+        } else {
+            VoucherStatus::Settled
+        };
+        write_voucher(env, voucher);
+
+        // No care was paid for when the split sends everything back, so no
+        // receipt is minted and the beneficiary's episode count stays put.
+        if to_provider > 0 {
+            ReceiptClient::new(env, &config.receipt_book).mint(
+                &escrow,
+                &voucher.id,
+                &voucher.beneficiary_ref,
+                &voucher.provider,
+                &voucher.service_code,
+                &to_provider,
+            );
+        }
+    }
+
     /// Returns the full escrowed amount to the funder. No fee is taken on
     /// care that never happened.
-    fn pay_back(env: &Env, config: &Config, voucher: &mut Voucher) {
+    fn pay_back(env: &Env, config: &Config, voucher: &mut Voucher) -> Result<(), VoucherError> {
         token::Client::new(env, &config.token).transfer(
             &env.current_contract_address(),
             &voucher.funder,
             &voucher.amount,
         );
+        decrease_open_escrow(env, voucher.amount)?;
 
         voucher.status = VoucherStatus::Refunded;
         write_voucher(env, voucher);
@@ -714,5 +875,6 @@ impl VoucherEscrow {
             service_code: voucher.service_code,
         }
         .publish(env);
+        Ok(())
     }
 }
