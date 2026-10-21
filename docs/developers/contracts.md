@@ -179,6 +179,7 @@ pub struct Config {
 | --- | --- | --- | --- |
 | `initialize` | `admin, registry, receipt_book, token, dispute_window, fee_bps, attester_share_bps, fee_account` | `()` | once |
 | `create_voucher` | `funder, beneficiary_ref, provider, service_code, amount, expires_at` | `u64` | `funder` |
+| `reduce_amount` | `funder, voucher_id, new_amount` | `()` | `funder` |
 | `claim` | `provider, voucher_id` | `()` | `provider` |
 | `attest` | `attester, voucher_id` | `()` | `attester` |
 | `dispute` | `funder, voucher_id, reason_code` | `()` | `funder` |
@@ -212,6 +213,7 @@ Every public function, with the exact signer it demands. `AUTH_MATRIX` in `contr
 | --- | --- |
 | `initialize` | none (one-shot) |
 | `create_voucher` | `funder` |
+| `reduce_amount` | `funder` |
 | `claim` | `provider` |
 | `attest` | `attester` |
 | `dispute` | `funder` |
@@ -242,6 +244,8 @@ rejects the voucher's own provider even if it holds that role.
 
 **`create_voucher`** — amount > 0; expiry in the future; provider is `Active`; the service exists and is active; amount ≥ listed price; the service is not paused (`ServiceUnavailable`). Transfers the token *before* writing the voucher, so a failed transfer reverts everything.
 
+**`reduce_amount`** — caller is the funder of this voucher (`NotAuthorized`); status is `Funded` (`InvalidStatus`); `new_amount` > 0 (`InvalidAmount`) and strictly below the escrowed amount (`AmountNotReduced`); the service is still listed (`ServiceNotOffered`); and `new_amount` ≥ the price the registry lists **at call time** (`AmountBelowPrice`). The difference goes straight back to the funder and the escrow keeps the rest; no fee is taken on money that never became care, and the `open_escrow` total follows the difference down. The price at call time is the floor, not the price at funding time: a clinic that has raised its price cannot have a funded voucher reduced below that price, and a clinic that has lowered it frees the funder to reduce further. A voucher whose service has been delisted cannot be reduced at all — there is no floor to reduce towards — and is refunded at expiry instead. Once the clinic has claimed the voucher the amount is what the clinic expects to be paid, so the reduction is closed.
+
 **`claim`** — caller is the named provider; provider is still `Active` in the registry; status is `Funded`; not expired.
 
 **`attest`** — caller is a registry attester; caller is **not** the provider; status is `Claimed`; the attester has attestations left today. Stores the attester on the voucher and sets `dispute_deadline = now + dispute_window`.
@@ -258,7 +262,7 @@ rejects the voucher's own provider even if it holds that role.
 
 **`resolve_dispute`** — caller is admin; status is `Disputed`. Routes to funder or provider; no third destination exists.
 
-**`escrow_summary`** — a read-only solvency check returning `(open_escrow, token_balance)`. `open_escrow` is a running instance-storage total of every funded voucher that has not yet settled or refunded; it is increased by `create_voucher` and decreased by `settle`, `refund` and both outcomes of `resolve_dispute`. `token_balance` is the contract's real balance of the settlement token. The two are equal when the accounting is correct, so anyone can check the contract without scanning every voucher. No authorisation is required.
+**`escrow_summary`** — a read-only solvency check returning `(open_escrow, token_balance)`. `open_escrow` is a running instance-storage total of every funded voucher that has not yet settled or refunded; it is increased by `create_voucher` and decreased by `settle`, `refund` and both outcomes of `resolve_dispute`, and by `reduce_amount` for the part that goes back to the funder. `token_balance` is the contract's real balance of the settlement token. The two are equal when the accounting is correct, so anyone can check the contract without scanning every voucher. No authorisation is required.
 
 ### Errors
 
@@ -277,6 +281,7 @@ rejects the voucher's own provider even if it holds that role.
 |  |  | 19 | `AttestationCapReached` |
 |  |  | 20 | `InvalidAttestationCap` |
 |  |  | 21 | `InvalidAttesterShare` |
+|  |  | 22 | `AmountNotReduced` |
 
 ### Events
 
@@ -288,6 +293,7 @@ rejects the voucher's own provider even if it holds that role.
 | `voucher_disputed` | `funder` | `voucher_id`, `reason_code`, `service_code`, `amount` |
 | `voucher_settled` | `provider` | `voucher_id`, `net`, `fee`, `service_code`, `amount`, `attester_share` |
 | `voucher_refunded` | `funder` | `voucher_id`, `amount`, `service_code` |
+| `voucher_amount_reduced` | `funder` | `voucher_id`, `service_code`, `previous_amount`, `amount`, `refunded` |
 | `dispute_resolved` | `admin` | `voucher_id`, `refunded_funder`, `to_provider`, `fee`, `to_funder` |
 | `attestation_cap_changed` | `admin` | `cap` |
 
@@ -296,6 +302,8 @@ rejects the voucher's own provider even if it holds that role.
 > Every event in this table has a snapshot test that reads the decoded XDR and asserts the exact topic list and data map — `*_event_snapshot` in each contract's `src/test.rs`. Changing a field name, moving a field between topic and data, or adding a field fails that test with a message naming `TOPIC_FIELDS` in `sci-healthcare-backend/src/stellar/events.ts`.
 >
 > Every lifecycle event now carries `service_code` and `amount`, appended **after** the fields each event already had, so one event says what was paid for without a storage lookup. The data map is keyed by field name (an XDR `ScMap`), and existing fields keep their positions: decoders that read by name — including `sci-healthcare-backend` — pick the new fields up without a breaking change. `voucher_refunded` already carried `amount`; it gains `service_code` only.
+>
+> `voucher_amount_reduced` is new, so it needs one line in the indexer: `voucher_amount_reduced: ['funder']` in `TOPIC_FIELDS` in `sci-healthcare-backend/src/stellar/events.ts`. Without it the event still decodes — the decoder falls back to no topic names — but the `funder` topic reads as `undefined`. Its data fields are read by name and need no decoder change.
 
 ---
 

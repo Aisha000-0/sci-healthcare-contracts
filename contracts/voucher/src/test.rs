@@ -131,6 +131,18 @@ fn fund(f: &Fixture) -> u64 {
     )
 }
 
+/// Funds a voucher above the listed price, the way a mistyped amount does.
+fn fund_overpaid(f: &Fixture, amount: i128) -> u64 {
+    f.voucher.create_voucher(
+        &f.funder,
+        &patient(&f.env),
+        &f.provider,
+        &CONSULT,
+        &amount,
+        &(START_TIME + 30 * 24 * 60 * 60),
+    )
+}
+
 /// Asserts the reported open escrow and the contract's real token balance are
 /// both `expected`: the two drifting apart is the bug `escrow_summary` exists
 /// to expose.
@@ -405,6 +417,285 @@ fn rejects_expiry_in_the_past() {
         .unwrap()
         .unwrap();
     assert_eq!(err, VoucherError::InvalidExpiry);
+}
+
+// ----- reducing an overpayment -----
+//
+// A funder who paid more than the listed price can bring the escrowed
+// amount back down to the price and keep the voucher. The difference goes
+// back to the funder, and the voucher settles at the reduced amount.
+
+#[test]
+fn reduce_to_the_listed_price_succeeds() {
+    let f = setup();
+    let before = f.token.balance(&f.funder);
+    let overpaid = CONSULT_PRICE * 2;
+    let id = fund_overpaid(&f, overpaid);
+    assert_eq!(f.token.balance(&f.funder), before - overpaid);
+
+    f.voucher.reduce_amount(&f.funder, &id, &CONSULT_PRICE);
+
+    // Exactly the difference comes back, and the escrow keeps the rest.
+    assert_eq!(f.token.balance(&f.funder), before - CONSULT_PRICE);
+    assert_eq!(f.token.balance(&f.voucher.address), CONSULT_PRICE);
+    // The difference left escrow, so the running total follows it down.
+    assert_escrow(&f, CONSULT_PRICE);
+
+    let voucher = f.voucher.get_voucher(&id);
+    assert_eq!(voucher.amount, CONSULT_PRICE);
+    assert_eq!(
+        voucher.status,
+        VoucherStatus::Funded,
+        "reducing an overpayment must not cost the funder the voucher"
+    );
+}
+
+#[test]
+fn reducing_twice_returns_the_difference_each_time() {
+    let f = setup();
+    let before = f.token.balance(&f.funder);
+    let overpaid = CONSULT_PRICE * 3;
+    let id = fund_overpaid(&f, overpaid);
+
+    f.voucher
+        .reduce_amount(&f.funder, &id, &(CONSULT_PRICE * 2));
+    assert_eq!(f.token.balance(&f.funder), before - CONSULT_PRICE * 2);
+    assert_eq!(f.voucher.get_voucher(&id).amount, CONSULT_PRICE * 2);
+
+    f.voucher.reduce_amount(&f.funder, &id, &CONSULT_PRICE);
+    // The funder recovers exactly the difference each time, and the escrow
+    // keeps what is left.
+    assert_eq!(f.token.balance(&f.funder), before - CONSULT_PRICE);
+    assert_eq!(f.token.balance(&f.voucher.address), CONSULT_PRICE);
+    assert_escrow(&f, CONSULT_PRICE);
+    assert_eq!(f.voucher.get_voucher(&id).amount, CONSULT_PRICE);
+}
+
+#[test]
+fn cannot_reduce_below_the_listed_price() {
+    let f = setup();
+    let overpaid = CONSULT_PRICE * 2;
+    let id = fund_overpaid(&f, overpaid);
+
+    let err = f
+        .voucher
+        .try_reduce_amount(&f.funder, &id, &(CONSULT_PRICE - 1))
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VoucherError::AmountBelowPrice);
+
+    // Nothing moved: the voucher still carries the original amount.
+    assert_eq!(f.voucher.get_voucher(&id).amount, overpaid);
+    assert_eq!(f.token.balance(&f.voucher.address), overpaid);
+}
+
+#[test]
+fn cannot_reduce_after_the_voucher_is_claimed() {
+    let f = setup();
+    let id = fund_overpaid(&f, CONSULT_PRICE * 2);
+    f.voucher.claim(&f.provider, &id);
+
+    let err = f
+        .voucher
+        .try_reduce_amount(&f.funder, &id, &CONSULT_PRICE)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VoucherError::InvalidStatus);
+    assert_eq!(f.voucher.get_voucher(&id).amount, CONSULT_PRICE * 2);
+}
+
+#[test]
+fn cannot_reduce_after_the_voucher_is_settled() {
+    let f = setup();
+    let id = fund_overpaid(&f, CONSULT_PRICE * 2);
+    f.voucher.claim(&f.provider, &id);
+    f.voucher.attest(&f.attester, &id);
+    advance(&f.env, DISPUTE_WINDOW + 1);
+    f.voucher.settle(&id);
+
+    let err = f
+        .voucher
+        .try_reduce_amount(&f.funder, &id, &CONSULT_PRICE)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VoucherError::InvalidStatus);
+}
+
+#[test]
+fn only_the_funder_can_reduce_the_amount() {
+    let f = setup();
+    let id = fund_overpaid(&f, CONSULT_PRICE * 2);
+    let stranger = Address::generate(&f.env);
+
+    let err = f
+        .voucher
+        .try_reduce_amount(&stranger, &id, &CONSULT_PRICE)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VoucherError::NotAuthorized);
+    assert_eq!(f.voucher.get_voucher(&id).amount, CONSULT_PRICE * 2);
+}
+
+#[test]
+fn cannot_reduce_to_the_same_or_a_higher_amount() {
+    let f = setup();
+    let overpaid = CONSULT_PRICE * 2;
+    let id = fund_overpaid(&f, overpaid);
+
+    let err = f
+        .voucher
+        .try_reduce_amount(&f.funder, &id, &overpaid)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VoucherError::AmountNotReduced);
+
+    let err = f
+        .voucher
+        .try_reduce_amount(&f.funder, &id, &(overpaid * 2))
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VoucherError::AmountNotReduced);
+    assert_eq!(f.voucher.get_voucher(&id).amount, overpaid);
+}
+
+#[test]
+fn rejects_a_non_positive_new_amount() {
+    let f = setup();
+    let id = fund_overpaid(&f, CONSULT_PRICE * 2);
+
+    let err = f
+        .voucher
+        .try_reduce_amount(&f.funder, &id, &0i128)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VoucherError::InvalidAmount);
+
+    let err = f
+        .voucher
+        .try_reduce_amount(&f.funder, &id, &(-1i128))
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VoucherError::InvalidAmount);
+    assert_eq!(f.voucher.get_voucher(&id).amount, CONSULT_PRICE * 2);
+}
+
+#[test]
+fn cannot_reduce_when_the_service_is_no_longer_offered() {
+    // No listed price means no floor to reduce towards. The funder can
+    // still refund the voucher at expiry.
+    let f = setup();
+    let id = fund_overpaid(&f, CONSULT_PRICE * 2);
+    f.registry.remove_service(&f.provider, &CONSULT);
+
+    let err = f
+        .voucher
+        .try_reduce_amount(&f.funder, &id, &CONSULT_PRICE)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VoucherError::ServiceNotOffered);
+    assert_eq!(f.voucher.get_voucher(&id).amount, CONSULT_PRICE * 2);
+}
+
+#[test]
+fn reduce_uses_the_price_at_call_time() {
+    // A clinic that lowers its price frees the funder to reduce further.
+    let f = setup();
+    let overpaid = CONSULT_PRICE * 2;
+    let id = fund_overpaid(&f, overpaid);
+    let cheaper = CONSULT_PRICE / 2;
+
+    f.registry.upsert_service(
+        &f.provider,
+        &CONSULT,
+        &String::from_str(&f.env, "Outpatient consult"),
+        &cheaper,
+    );
+
+    f.voucher.reduce_amount(&f.funder, &id, &cheaper);
+    assert_eq!(f.voucher.get_voucher(&id).amount, cheaper);
+}
+
+#[test]
+fn cannot_reduce_below_a_price_the_clinic_has_raised() {
+    // The floor is the price at call time, not the price at funding time.
+    let f = setup();
+    let overpaid = CONSULT_PRICE * 2;
+    let id = fund_overpaid(&f, overpaid);
+    let effective_at = START_TIME + MIN_PRICE_NOTICE_SECS;
+    f.registry
+        .schedule_service_price(&f.provider, &CONSULT, &(CONSULT_PRICE * 3), &effective_at);
+    f.env.ledger().with_mut(|li| li.timestamp = effective_at);
+
+    let err = f
+        .voucher
+        .try_reduce_amount(&f.funder, &id, &CONSULT_PRICE)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VoucherError::AmountBelowPrice);
+    assert_eq!(f.voucher.get_voucher(&id).amount, overpaid);
+}
+
+#[test]
+fn a_reduced_voucher_settles_at_the_reduced_amount() {
+    let f = setup();
+    let id = fund_overpaid(&f, CONSULT_PRICE * 2);
+    f.voucher.reduce_amount(&f.funder, &id, &CONSULT_PRICE);
+
+    f.voucher.claim(&f.provider, &id);
+    f.voucher.attest(&f.attester, &id);
+    advance(&f.env, DISPUTE_WINDOW + 1);
+    f.voucher.settle(&id);
+
+    // The clinic is paid on what is left in escrow, and the receipt says
+    // the same thing.
+    let expected_fee = CONSULT_PRICE * FEE_BPS as i128 / 10_000;
+    let expected_attester_share = CONSULT_PRICE * ATTESTER_SHARE_BPS as i128 / 10_000;
+    assert_eq!(f.token.balance(&f.provider), CONSULT_PRICE - expected_fee);
+    assert_eq!(f.token.balance(&f.attester), expected_attester_share);
+    assert_eq!(
+        f.token.balance(&f.fee_account),
+        expected_fee - expected_attester_share
+    );
+    assert_eq!(f.token.balance(&f.voucher.address), 0);
+    assert_eq!(f.receipts.get_receipt(&id).amount, CONSULT_PRICE);
+}
+
+#[test]
+fn amount_reduced_event_snapshot() {
+    let f = setup();
+    let overpaid = CONSULT_PRICE * 2;
+    let id = fund_overpaid(&f, overpaid);
+
+    f.voucher.reduce_amount(&f.funder, &id, &CONSULT_PRICE);
+
+    let e = one_event(&f);
+    assert_layout(
+        &e,
+        "voucher_amount_reduced",
+        &[ScVal::from(&f.funder)],
+        &[
+            "voucher_id",
+            "service_code",
+            "previous_amount",
+            "amount",
+            "refunded",
+        ],
+    );
+    assert_eq!(field_u64(&e, "voucher_id"), id);
+    assert_eq!(field_u32(&e, "service_code"), CONSULT);
+    assert_eq!(field_i128(&e, "previous_amount"), overpaid);
+    assert_eq!(field_i128(&e, "amount"), CONSULT_PRICE);
+    assert_eq!(field_i128(&e, "refunded"), overpaid - CONSULT_PRICE);
 }
 
 // ----- happy path -----
@@ -1977,6 +2268,10 @@ const AUTH_MATRIX: &[AuthCase] = &[
         auth: signer("`funder`", funder_addr),
     },
     AuthCase {
+        function: "reduce_amount",
+        auth: signer("`funder`", funder_addr),
+    },
+    AuthCase {
         function: "claim",
         auth: signer("`provider`", provider_addr),
     },
@@ -2095,6 +2390,10 @@ fn run_case(f: &AuthFixture, function: &str) -> std::vec::Vec<Address> {
         }
         "create_voucher" => {
             fund(&f.f);
+        }
+        "reduce_amount" => {
+            let id = fund_overpaid(&f.f, CONSULT_PRICE * 2);
+            voucher.reduce_amount(&f.f.funder, &id, &CONSULT_PRICE);
         }
         "claim" => {
             let id = fund(&f.f);

@@ -637,6 +637,12 @@
                   },
                   {
                     "key": {
+                      "symbol": "attester"
+                    },
+                    "val": "void"
+                  },
+                  {
+                    "key": {
                       "symbol": "beneficiary_ref"
                     },
                     "val": {
@@ -825,6 +831,18 @@
                       },
                       "val": {
                         "u64": "2"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "OpenEscrow"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "30000000"
                       }
                     }
                   ]

@@ -133,6 +133,9 @@ pub enum VoucherError {
     /// `attester_share_bps` was greater than `fee_bps`. The attester's share
     /// is carved out of the protocol fee, so it cannot exceed it.
     InvalidAttesterShare = 21,
+    /// The new amount is not lower than the amount already escrowed, so
+    /// there is nothing to give back.
+    AmountNotReduced = 22,
 }
 
 /// Maps the shared helpers' failures onto this contract's error numbers, so
