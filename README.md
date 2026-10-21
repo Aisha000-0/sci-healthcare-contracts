@@ -243,6 +243,7 @@ deployed contract.
 | `refundable_at(voucher_id)` | view | When `refund` will succeed |
 | `propose_admin` / `accept_admin` | admin / nominee | Two-step admin handover |
 | `resolve_dispute(admin, voucher_id, refund_funder)` | admin | Routes escrow to one of the two parties |
+| `resolve_split(admin, voucher_id, to_provider)` | admin | Splits escrow between the clinic, the fee account and the funder |
 | `quote(amount)` | view | `(fee, net)` so a clinic sees exactly what lands |
 
 ### `receipt`
