@@ -213,7 +213,7 @@ impl VoucherEscrow {
     /// Provider marks the patient as presented and the service as begun.
     ///
     /// A provider suspended after the voucher was funded cannot claim it;
-    /// the voucher simply runs to expiry and refunds.
+    /// the voucher can be refunded at once instead of waiting for expiry.
     pub fn claim(env: Env, provider: Address, voucher_id: u64) -> Result<(), VoucherError> {
         provider.require_auth();
 
@@ -371,17 +371,22 @@ impl VoucherEscrow {
 
     /// Returns escrow to the funder when care can no longer happen.
     ///
-    /// - A `Funded` voucher is refundable once it expires unclaimed.
+    /// - A `Funded` voucher is refundable once it expires unclaimed, or
+    ///   immediately if its provider is no longer active in the registry.
+    ///   A clinic suspended after the voucher was funded cannot serve it,
+    ///   so the funder should not have to wait for expiry.
     /// - A `Claimed` voucher that was never attested is refundable once
     ///   `CLAIM_GRACE_SECS` have passed after expiry, so a claim alone can
-    ///   never lock the funder's money forever.
+    ///   never lock the funder's money forever. Suspension does not shorten
+    ///   this path: care may already have been given before the clinic was
+    ///   suspended, and an attester may still confirm it.
     ///
     /// Permissionless for the same reason as `settle`.
     pub fn refund(env: Env, voucher_id: u64) -> Result<(), VoucherError> {
         let config = read_config(&env)?;
         let mut voucher = read_voucher(&env, voucher_id)?;
 
-        let refundable_at = Self::refundable_at_for(&voucher)?;
+        let refundable_at = Self::refundable_at_for(&env, &config, &voucher)?;
         if env.ledger().timestamp() < refundable_at {
             return Err(VoucherError::NotYetExpired);
         }
@@ -491,8 +496,13 @@ impl VoucherEscrow {
 
     /// Earliest ledger time at which `refund` will succeed, or
     /// `InvalidStatus` if this voucher can no longer be refunded.
+    ///
+    /// A funded voucher whose provider is no longer active returns the
+    /// current ledger time: it is refundable now, before expiry.
     pub fn refundable_at(env: Env, voucher_id: u64) -> Result<u64, VoucherError> {
-        Self::refundable_at_for(&read_voucher(&env, voucher_id)?)
+        let voucher = read_voucher(&env, voucher_id)?;
+        let config = read_config(&env)?;
+        Self::refundable_at_for(&env, &config, &voucher)
     }
 
     pub fn get_voucher(env: Env, voucher_id: u64) -> Result<Voucher, VoucherError> {
@@ -525,9 +535,29 @@ impl VoucherEscrow {
 
     // ----- internal -----
 
-    fn refundable_at_for(voucher: &Voucher) -> Result<u64, VoucherError> {
+    fn refundable_at_for(
+        env: &Env,
+        config: &Config,
+        voucher: &Voucher,
+    ) -> Result<u64, VoucherError> {
         match voucher.status {
-            VoucherStatus::Funded => Ok(voucher.expires_at),
+            VoucherStatus::Funded => {
+                let now = env.ledger().timestamp();
+                // Keep the ordinary expiry path free of a cross-contract
+                // call, so a registry problem can never block a refund that
+                // was already due. Only a voucher still inside its validity
+                // needs the registry to decide whether the clinic can serve
+                // it at all.
+                if now >= voucher.expires_at {
+                    Ok(voucher.expires_at)
+                } else if !RegistryClient::new(env, &config.registry)
+                    .is_active_provider(&voucher.provider)
+                {
+                    Ok(now)
+                } else {
+                    Ok(voucher.expires_at)
+                }
+            }
             VoucherStatus::Claimed => voucher
                 .expires_at
                 .checked_add(CLAIM_GRACE_SECS)

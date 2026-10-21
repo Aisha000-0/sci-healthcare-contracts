@@ -112,11 +112,13 @@ Three contracts, one responsibility each.
                  claim              attest             settle
   Funded ──────────────> Claimed ───────────> Attested ────────> Settled
     │                       │                     │
-    │ refund (past expiry)  │ dispute             │ dispute
-    ▼                       ▼                     ▼
- Refunded  <───────────  Disputed  ──── resolve ──┴──> Settled
-    ▲                       │
-    └───────────────────────┘ refund (claimed, never attested, 7 days past expiry)
+    │ refund                │ dispute             │ dispute
+    │ (expired or           ▼                     ▼
+    │  clinic inactive)  Disputed <───────────────┘
+    ▼                       │
+ Refunded  <──── resolve ────┴──── resolve ────> Settled
+    ▲
+    └── refund (claimed, never attested, 7 days past expiry)
 ```
 
 `settle` and `refund` are **permissionless** — a clinic never depends on the funder or an operator to get paid.
@@ -236,7 +238,7 @@ deployed contract.
 | `attest(attester, voucher_id)` | attester | Confirms delivery; opens the dispute window |
 | `dispute(funder, voucher_id, reason_code)` | funder | Contests before the window closes |
 | `settle(voucher_id)` | none | Releases escrow once the window closes |
-| `refund(voucher_id)` | none | Returns escrow after an unclaimed voucher expires, or 7 days after expiry if claimed but never attested |
+| `refund(voucher_id)` | none | Returns escrow once an unclaimed voucher expires or its clinic is no longer active, or 7 days after expiry if claimed but never attested |
 | `set_attestation_cap(admin, cap)` | admin | Caps attestations per attester per UTC day (default 100) |
 | `refundable_at(voucher_id)` | view | When `refund` will succeed |
 | `propose_admin` / `accept_admin` | admin / nominee | Two-step admin handover |

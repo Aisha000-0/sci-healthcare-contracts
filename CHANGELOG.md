@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- **voucher:** `refund` now returns a `Funded` voucher immediately when its clinic is no longer active in the registry, instead of making the funder wait for expiry. `refundable_at` reports the current ledger time in that case. `Claimed` vouchers keep the normal seven-day claim grace even if the clinic is later suspended, because care may already have been given. No event or storage layout changes; the existing `voucher_refunded` event is reused, so the backend decoder needs no update.
 - **test:** every error variant in `VoucherError`, `RegistryError`, `ReceiptError` and `FaucetError` now has a dedicated test that triggers it, satisfying the requirement that all error codes are reachable and tested. Closes #109.
 - **ci:** `unwrap()` and `expect()` are now denied in contract code (outside tests) via `#![deny(clippy::unwrap_used, clippy::expect_used)]` gated to non-test builds. Existing uses were replaced with proper error returns. CI fails on any new unwrap in contract code. Closes #110.
 - **ci:** a `reproducible-build` job builds the contracts twice in clean directories and compares `SHA256SUMS`; CI fails if the two builds differ. Closes #111.
@@ -54,7 +55,7 @@
 - **cargo:** the workspace path dependencies carry a version, so `cargo deny` does not read them as wildcard version requirements.
 - **voucher:** `voucher_claimed`, `voucher_attested`, `voucher_disputed`, `voucher_settled` and `voucher_refunded` now carry `service_code` and `amount` in their data, appended after the fields each event already had. Only `voucher_created` used to say what the voucher was for, so an indexer or wallet reading a single lifecycle event had to load the voucher to show what was paid for. `voucher_refunded` already carried `amount`; it gains `service_code` only. Topics are unchanged and the data map is keyed by name, so the indexer in `sci-healthcare-backend` decodes the new layout without a breaking change (its matching decoder change is linked from the pull request). Covered by five event snapshot tests in `contracts/voucher/src/test.rs` that read the decoded XDR event and the regenerated `test_snapshots`.
 
-Tests: 178 (was 135).
+Tests: 189 (was 186).
 
 ## 0.2.0 — 2026-10-09
 

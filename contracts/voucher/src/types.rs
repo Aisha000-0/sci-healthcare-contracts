@@ -6,12 +6,13 @@ use soroban_sdk::{contracterror, contracttype, Address, BytesN};
 ///                  claim            attest          settle
 ///   Funded ──────────────> Claimed ────────> Attested ──────> Settled
 ///     │                       │                  │
-///     │ refund (past expiry)  │ dispute          │ dispute
-///     ▼                       ▼                  ▼
-///  Refunded  <──────────  Disputed  ────────────────> (resolve)
-///     ▲                       │
-///     └───────────────────────┘
-///       refund (claimed, never attested, past expiry + claim grace)
+///     │ refund                │ dispute          │ dispute
+///     │ (expired or           ▼                  ▼
+///     │  clinic inactive)  Disputed <────────────┘
+///     ▼                       │
+///  Refunded  <──── resolve ───┴──── resolve ────> Settled
+///     ▲
+///     └── refund (claimed, never attested, past expiry + claim grace)
 /// ```
 ///
 /// `Settled` and `Refunded` are terminal.
