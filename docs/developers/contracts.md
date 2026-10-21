@@ -158,6 +158,18 @@ pub struct Voucher {
     pub claimed_at: u64,
     pub attested_at: u64,
     pub dispute_deadline: u64,
+    pub attester: Option<Address>,     // set by `attest`, paid at settlement
+}
+
+pub struct Config {
+    pub admin: Address,
+    pub registry: Address,
+    pub receipt_book: Address,
+    pub token: Address,
+    pub dispute_window: u64,
+    pub fee_bps: u32,
+    pub attester_share_bps: u32,       // part of fee_bps, never more
+    pub fee_account: Address,
 }
 ```
 
@@ -165,7 +177,7 @@ pub struct Voucher {
 
 | Function | Parameters | Returns | Auth |
 | --- | --- | --- | --- |
-| `initialize` | `admin, registry, receipt_book, token, dispute_window, fee_bps, fee_account` | `()` | once |
+| `initialize` | `admin, registry, receipt_book, token, dispute_window, fee_bps, attester_share_bps, fee_account` | `()` | once |
 | `create_voucher` | `funder, beneficiary_ref, provider, service_code, amount, expires_at` | `u64` | `funder` |
 | `claim` | `provider, voucher_id` | `()` | `provider` |
 | `attest` | `attester, voucher_id` | `()` | `attester` |
@@ -186,7 +198,7 @@ pub struct Voucher {
 | `quote` | `amount` | `(i128, i128)` | view |
 | `version` | — | `String` | view |
 
-`fee_bps` is capped at 1000 (10%) at initialisation.
+`fee_bps` is capped at 1000 (10%) at initialisation. `attester_share_bps` is the part of the voucher amount paid to the attester who confirmed delivery, and must be **no greater than `fee_bps`** (`InvalidAttesterShare`, #21). It is carved out of the fee, so the clinic's net is unchanged and the payouts sum exactly to the voucher amount. Zero keeps the pre-attester-share behaviour: the fee account receives the whole fee.
 
 `settle` and `refund` take no authorisation deliberately: a clinic that has delivered attested care must never depend on the funder or an operator to be paid.
 
@@ -228,13 +240,13 @@ rejects the voucher's own provider even if it holds that role.
 
 **`claim`** — caller is the named provider; provider is still `Active` in the registry; status is `Funded`; not expired.
 
-**`attest`** — caller is a registry attester; caller is **not** the provider; status is `Claimed`; the attester has attestations left today. Sets `dispute_deadline = now + dispute_window`.
+**`attest`** — caller is a registry attester; caller is **not** the provider; status is `Claimed`; the attester has attestations left today. Stores the attester on the voucher and sets `dispute_deadline = now + dispute_window`.
 
 **`set_attestation_cap`** — caller is admin; `cap` ≥ 1 (`InvalidAttestationCap`). Each attester may attest at most `cap` vouchers per UTC day (`timestamp / 86400`); the next is rejected with `AttestationCapReached` until midnight UTC, when the counter resets. The default is `DEFAULT_MAX_ATTESTATIONS_PER_DAY` (100). Counters live in temporary storage keyed by `(attester, day)`. The cap bounds what a stolen attester key can confirm before the admin removes it from the registry; `attestations_left(attester)` and the `remaining_today` field of `voucher_attested` show how close an attester is.
 
 **`dispute`** — caller is the funder; status is `Claimed`, or `Attested` and before the deadline.
 
-**`settle`** — status is `Attested`; now ≥ `dispute_deadline`. Pays provider, takes fee, mints a receipt.
+**`settle`** — status is `Attested`; now ≥ `dispute_deadline`. Pays the clinic `amount - fee`, the attester its share (`amount * attester_share_bps / 10_000`), and the fee account the remaining fee, then mints a receipt. The three payouts sum to `amount` exactly. If no attester is recorded — a dispute resolved for the provider without an attestation — the fee account receives the whole fee.
 
 **`refund`** — status is `Funded` and either now ≥ `expires_at` or the provider is no longer active in the registry (so a suspended clinic's voucher is refundable immediately, before expiry), or status is `Claimed` and now ≥ `expires_at + CLAIM_GRACE_SECS` (7 days). Suspension does not shorten the claim grace: care may already have been given. Returns the full amount, no fee. `refundable_at` returns the exact time, which is the current ledger time when a funded voucher's provider is inactive.
 
@@ -258,6 +270,7 @@ rejects the voucher's own provider even if it holds that role.
 |  |  | 18 | `ServiceUnavailable` |
 |  |  | 19 | `AttestationCapReached` |
 |  |  | 20 | `InvalidAttestationCap` |
+|  |  | 21 | `InvalidAttesterShare` |
 
 ### Events
 
@@ -267,7 +280,7 @@ rejects the voucher's own provider even if it holds that role.
 | `voucher_claimed` | `provider` | `voucher_id`, `claimed_at`, `service_code`, `amount` |
 | `voucher_attested` | `attester` | `voucher_id`, `attested_at`, `dispute_deadline`, `service_code`, `amount`, `remaining_today` |
 | `voucher_disputed` | `funder` | `voucher_id`, `reason_code`, `service_code`, `amount` |
-| `voucher_settled` | `provider` | `voucher_id`, `net`, `fee`, `service_code`, `amount` |
+| `voucher_settled` | `provider` | `voucher_id`, `net`, `fee`, `service_code`, `amount`, `attester_share` |
 | `voucher_refunded` | `funder` | `voucher_id`, `amount`, `service_code` |
 | `dispute_resolved` | `admin` | `voucher_id`, `refunded_funder` |
 | `attestation_cap_changed` | `admin` | `cap` |

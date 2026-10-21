@@ -102,6 +102,7 @@ impl VoucherEscrow {
         token: Address,
         dispute_window: u64,
         fee_bps: u32,
+        attester_share_bps: u32,
         fee_account: Address,
     ) -> Result<(), VoucherError> {
         if has_config(&env) {
@@ -109,6 +110,11 @@ impl VoucherEscrow {
         }
         if fee_bps > MAX_FEE_BPS {
             return Err(VoucherError::InvalidFee);
+        }
+        // The attester's share is carved out of the protocol fee, so it can
+        // never be larger than the fee itself.
+        if attester_share_bps > fee_bps {
+            return Err(VoucherError::InvalidAttesterShare);
         }
 
         write_config(
@@ -120,6 +126,7 @@ impl VoucherEscrow {
                 token,
                 dispute_window,
                 fee_bps,
+                attester_share_bps,
                 fee_account,
             },
         );
@@ -193,6 +200,7 @@ impl VoucherEscrow {
             claimed_at: 0,
             attested_at: 0,
             dispute_deadline: 0,
+            attester: None,
         };
         write_voucher(&env, &voucher);
 
@@ -289,6 +297,7 @@ impl VoucherEscrow {
 
         voucher.status = VoucherStatus::Attested;
         voucher.attested_at = now;
+        voucher.attester = Some(attester.clone());
         voucher.dispute_deadline = now
             .checked_add(config.dispute_window)
             .ok_or(VoucherError::MathOverflow)?;
@@ -569,24 +578,53 @@ impl VoucherEscrow {
     /// Basis-point fee. Integer math throughout; truncation favours the
     /// provider, never the protocol.
     fn fee_for(amount: i128, fee_bps: u32) -> Result<i128, VoucherError> {
+        Self::bps_of(amount, fee_bps)
+    }
+
+    /// Share of `amount` in basis points, rounded down.
+    fn bps_of(amount: i128, bps: u32) -> Result<i128, VoucherError> {
         amount
-            .checked_mul(fee_bps as i128)
+            .checked_mul(bps as i128)
             .ok_or(VoucherError::MathOverflow)?
             .checked_div(BPS_DENOMINATOR)
             .ok_or(VoucherError::MathOverflow)
     }
 
-    /// Pays the provider, takes the fee, and mints the care receipt.
+    /// Pays the provider, splits the fee between the attester and the fee
+    /// account, and mints the care receipt.
+    ///
+    /// `Config` guarantees `attester_share_bps <= fee_bps`, so the attester
+    /// share can never exceed the fee and the three payouts always sum to the
+    /// voucher amount exactly:
+    ///
+    /// ```text
+    /// net             = amount - fee
+    /// attester_share  = amount * attester_share_bps / 10_000
+    /// fee_account     = fee - attester_share
+    /// ```
+    ///
+    /// A voucher attested before attesters were stored has no attester to pay,
+    /// so the whole fee goes to the fee account, as it did before.
     fn pay_out(env: &Env, config: &Config, voucher: &mut Voucher) -> Result<(), VoucherError> {
         let fee = Self::fee_for(voucher.amount, config.fee_bps)?;
         let net = voucher.amount - fee;
+        let attester_share = match &voucher.attester {
+            Some(_) => Self::bps_of(voucher.amount, config.attester_share_bps)?,
+            None => 0,
+        };
+        let fee_account_share = fee - attester_share;
 
         let token_client = token::Client::new(env, &config.token);
         let escrow = env.current_contract_address();
 
         token_client.transfer(&escrow, &voucher.provider, &net);
-        if fee > 0 {
-            token_client.transfer(&escrow, &config.fee_account, &fee);
+        if let Some(attester) = &voucher.attester {
+            if attester_share > 0 {
+                token_client.transfer(&escrow, attester, &attester_share);
+            }
+        }
+        if fee_account_share > 0 {
+            token_client.transfer(&escrow, &config.fee_account, &fee_account_share);
         }
 
         voucher.status = VoucherStatus::Settled;
@@ -606,6 +644,7 @@ impl VoucherEscrow {
             voucher_id: voucher.id,
             net,
             fee,
+            attester_share,
             service_code: voucher.service_code,
             amount: voucher.amount,
         }
