@@ -185,6 +185,7 @@ pub struct Voucher {
 | `get_config` | — | `Config` | view |
 | `next_voucher_id` | — | `u64` | view |
 | `quote` | `amount` | `(i128, i128)` | view |
+| `escrow_summary` | — | `(i128, i128)` | view |
 | `version` | — | `String` | view |
 
 `fee_bps` is capped at 1000 (10%) at initialisation.
@@ -217,6 +218,7 @@ Every public function, with the exact signer it demands. `AUTH_MATRIX` in `contr
 | `get_config` | none (view) |
 | `next_voucher_id` | none (view) |
 | `quote` | none (view) |
+| `escrow_summary` | none (view) |
 | `version` | none (view) |
 
 `settle` and `refund` are the two permissionless rows, and that is the point:
@@ -244,7 +246,7 @@ rejects the voucher's own provider even if it holds that role.
 
 **`resolve_dispute`** — caller is admin; status is `Disputed`. Routes to funder or provider; no third destination exists.
 
-**`resolve_split`** — caller is admin; status is `Disputed`; `0 ≤ to_provider ≤ amount`, else `InvalidAmount`. Pays `to_provider - fee(to_provider)` to the clinic, the fee on that part to the fee account, and `amount - to_provider` back to the funder. The parts sum to the voucher amount exactly, and the escrow is empty afterwards. A receipt is minted for `to_provider` only when it is greater than zero. A split of `0` ends `Refunded`; any larger split ends `Settled`. Like `resolve_dispute`, the admin can send escrow only to the clinic, the fee account and the funder.
+**`escrow_summary`** — a read-only solvency check returning `(open_escrow, token_balance)`. `open_escrow` is a running instance-storage total of every funded voucher that has not yet settled or refunded; it is increased by `create_voucher` and decreased by `settle`, `refund` and both outcomes of `resolve_dispute`. `token_balance` is the contract's real balance of the settlement token. The two are equal when the accounting is correct, so anyone can check the contract without scanning every voucher. No authorisation is required.
 
 ### Errors
 
@@ -377,7 +379,7 @@ Lets anyone trying the demo get test USDC without a server holding the issuer ke
 
 | Function | Parameters | Returns | Auth |
 | --- | --- | --- | --- |
-| `initialize` | `admin, token, amount, cooldown, daily_cap` | `()` | once |
+| `initialize` | `admin, token, amount, cooldown, daily_cap, lifetime_cap` | `()` | once |
 | `drip` | `to` | `i128` | `to` |
 | `set_drip` | `admin, amount, cooldown` | `()` | `admin` |
 | `set_paused` | `admin, paused` | `()` | `admin` |
@@ -390,6 +392,8 @@ Lets anyone trying the demo get test USDC without a server holding the issuer ke
 
 `initialize` sets a `daily_cap` — the total base units the faucet may mint per UTC day across every address combined. The counter resets at each day boundary, and drips beyond it are rejected with `DailyCapReached`. The admin can pause the faucet with `set_paused(admin, true)` without giving up the token admin role; while paused, every `drip` is rejected with `Paused`.
 
+`initialize` also sets a per-address `lifetime_cap`: the total base units one address may ever receive. It is tracked in a persistent counter per address and never resets, so an address at its cap is rejected with `LifetimeCapReached` even on a new UTC day. A `lifetime_cap` of `0` means unlimited; a negative value is rejected with `InvalidAmount`. The counter is TTL-extended on every read and write.
+
 On testnet the faucet drips 50 USDC once a day: [`CCB25WG7DQ2CSNXPTOHZO2PDZ324FQPZLH3LSNCCLWYM3FEH52GEXC47`](https://stellar.expert/explorer/testnet/contract/CCB25WG7DQ2CSNXPTOHZO2PDZ324FQPZLH3LSNCCLWYM3FEH52GEXC47).
 
 | # | Error |
@@ -401,6 +405,7 @@ On testnet the faucet drips 50 USDC once a day: [`CCB25WG7DQ2CSNXPTOHZO2PDZ324FQ
 | 5 | `CoolingDown` |
 | 6 | `DailyCapReached` |
 | 7 | `Paused` |
+| 8 | `LifetimeCapReached` |
 
 ### Events
 
@@ -431,6 +436,7 @@ stays in the live ledger. These are the numbers, all in ledgers:
 | `Receipt(id)`, `Count(beneficiary_ref)` | persistent | every read and write | 30 days | 90 days |
 | `ProviderCount(provider)`, `ProviderReceipt(provider, index)` | persistent | every mint and `receipts_of_provider` read | 30 days | 90 days |
 | Faucet `LastDrip(address)` | temporary | every drip | 1 day | 7 days |
+| Faucet `LifetimeDripped(address)` | persistent | every drip and lifetime-cap read | 30 days | 90 days |
 
 "Extended when" is a threshold, not a refresh on every call: the TTL is only
 pushed back out once the remaining life drops below the threshold. A read on
