@@ -1,17 +1,12 @@
+use sci_common as common;
 use soroban_sdk::{Address, Env};
+
+use crate::DEFAULT_MAX_ATTESTATIONS_PER_DAY;
 
 use crate::types::{Config, DataKey, Voucher, VoucherError};
 
-const DAY_IN_LEDGERS: u32 = 17_280;
-const INSTANCE_TTL_THRESHOLD: u32 = 7 * DAY_IN_LEDGERS;
-const INSTANCE_TTL_EXTEND: u32 = 30 * DAY_IN_LEDGERS;
-const PERSISTENT_TTL_THRESHOLD: u32 = 30 * DAY_IN_LEDGERS;
-const PERSISTENT_TTL_EXTEND: u32 = 90 * DAY_IN_LEDGERS;
-
 pub(crate) fn extend_instance(env: &Env) {
-    env.storage()
-        .instance()
-        .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
+    common::extend_instance(env);
 }
 
 pub(crate) fn has_config(env: &Env) -> bool {
@@ -47,9 +42,7 @@ pub(crate) fn read_voucher(env: &Env, id: u64) -> Result<Voucher, VoucherError> 
         .persistent()
         .get(&key)
         .ok_or(VoucherError::VoucherNotFound)?;
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+    common::extend_persistent(env, &key);
     Ok(voucher)
 }
 
@@ -61,22 +54,64 @@ pub(crate) fn read_voucher(env: &Env, id: u64) -> Result<Voucher, VoucherError> 
 pub(crate) fn write_voucher(env: &Env, voucher: &Voucher) {
     let key = DataKey::Voucher(voucher.id);
     env.storage().persistent().set(&key, voucher);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+    common::extend_persistent(env, &key);
     extend_instance(env);
 }
 
-pub(crate) fn read_pending_admin(env: &Env) -> Option<Address> {
-    env.storage().instance().get(&DataKey::PendingAdmin)
-}
-
-pub(crate) fn write_pending_admin(env: &Env, pending: &Address) {
+/// Total amount currently held in escrow; 0 if nothing has ever been funded.
+pub(crate) fn read_open_escrow(env: &Env) -> i128 {
     env.storage()
         .instance()
-        .set(&DataKey::PendingAdmin, pending);
+        .get(&DataKey::OpenEscrow)
+        .unwrap_or(0)
 }
 
-pub(crate) fn clear_pending_admin(env: &Env) {
-    env.storage().instance().remove(&DataKey::PendingAdmin);
+fn write_open_escrow(env: &Env, total: i128) {
+    env.storage().instance().set(&DataKey::OpenEscrow, &total);
+    extend_instance(env);
+}
+
+/// Adds newly escrowed funds to the running total.
+pub(crate) fn increase_open_escrow(env: &Env, amount: i128) -> Result<(), VoucherError> {
+    let total = read_open_escrow(env)
+        .checked_add(amount)
+        .ok_or(VoucherError::MathOverflow)?;
+    write_open_escrow(env, total);
+    Ok(())
+}
+
+/// Removes funds that have left escrow, either to the provider or the funder.
+pub(crate) fn decrease_open_escrow(env: &Env, amount: i128) -> Result<(), VoucherError> {
+    let total = read_open_escrow(env)
+        .checked_sub(amount)
+        .ok_or(VoucherError::MathOverflow)?;
+    write_open_escrow(env, total);
+    Ok(())
+}
+
+pub(crate) fn read_attestation_cap(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::AttestationCap)
+        .unwrap_or(DEFAULT_MAX_ATTESTATIONS_PER_DAY)
+}
+
+pub(crate) fn write_attestation_cap(env: &Env, cap: u32) {
+    env.storage().instance().set(&DataKey::AttestationCap, &cap);
+}
+
+/// Attestations `attester` has made on UTC `day`; 0 if none.
+pub(crate) fn read_attestations(env: &Env, attester: &Address, day: u64) -> u32 {
+    env.storage()
+        .temporary()
+        .get(&DataKey::Attestations(attester.clone(), day))
+        .unwrap_or(0)
+}
+
+pub(crate) fn write_attestations(env: &Env, attester: &Address, day: u64, count: u32) {
+    let key = DataKey::Attestations(attester.clone(), day);
+    env.storage().temporary().set(&key, &count);
+    env.storage()
+        .temporary()
+        .extend_ttl(&key, common::ATTESTATIONS_TTL, common::ATTESTATIONS_TTL);
 }

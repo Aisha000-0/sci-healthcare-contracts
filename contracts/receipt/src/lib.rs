@@ -1,4 +1,9 @@
 #![no_std]
+// A panic aborts the whole invocation with an opaque host error. Contract
+// code must return a typed error instead, so both are denied outside tests.
+// Tests keep them for brevity: they are fail-fast assertions, not contract
+// behaviour.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 //! # SCI Healthcare — Care Receipts
 //!
@@ -14,8 +19,12 @@
 //! There is deliberately no transfer function. These are bound to the
 //! beneficiary reference they were minted against.
 
+extern crate alloc;
+
+use sci_common as common;
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
+    String, Vec,
 };
 
 /// Typed contract events. Field names are part of the public interface:
@@ -24,6 +33,14 @@ use soroban_sdk::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Initialized {
     pub admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MinterProposed {
+    #[topic]
+    pub admin: Address,
+    pub pending_minter: Address,
 }
 
 #[contractevent]
@@ -59,11 +76,19 @@ pub struct ReceiptMinted {
     pub settled_at: u64,
 }
 
-const DAY_IN_LEDGERS: u32 = 17_280;
-const INSTANCE_TTL_THRESHOLD: u32 = 7 * DAY_IN_LEDGERS;
-const INSTANCE_TTL_EXTEND: u32 = 30 * DAY_IN_LEDGERS;
-const PERSISTENT_TTL_THRESHOLD: u32 = 30 * DAY_IN_LEDGERS;
-const PERSISTENT_TTL_EXTEND: u32 = 90 * DAY_IN_LEDGERS;
+/// Most receipts one `receipts_of_provider` call may return.
+///
+/// Caps the response so a clinic with a long history cannot make a single
+/// read exceed the host's resource limits; callers page with `start`.
+pub const MAX_RECEIPTS_PAGE: u32 = 50;
+
+/// Human-readable name wallets and explorers show for a receipt.
+const RECEIPT_NAME: &str = "SCI Care Receipt";
+/// Token-style symbol explorers use when listing the receipt.
+const RECEIPT_SYMBOL: &str = "SCIREC";
+/// Base of the per-receipt URI. Only the voucher id is appended, so the URI
+/// carries no patient or beneficiary data.
+const RECEIPT_URI_BASE: &str = "https://receipts.sci.health/v1/receipt/";
 
 /// A settled care episode.
 ///
@@ -93,6 +118,12 @@ pub enum DataKey {
     Count(BytesN<32>),
     /// Address nominated by `propose_admin`, awaiting `accept_admin`.
     PendingAdmin,
+    /// Address nominated by `propose_minter`, awaiting `accept_minter`.
+    PendingMinter,
+    /// Number of receipts minted for a provider: the provider index length.
+    ProviderCount(Address),
+    /// A provider's receipt ids in mint order: `(provider, index) -> voucher_id`.
+    ProviderReceipt(Address, u32),
 }
 
 #[contracterror]
@@ -106,6 +137,18 @@ pub enum ReceiptError {
     ReceiptExists = 5,
     InvalidAmount = 6,
     NoPendingAdmin = 7,
+    NoPendingMinter = 8,
+}
+
+/// Maps the shared helpers' failures onto this contract's error numbers, so
+/// callers keep seeing the same codes they did before the helpers were shared.
+impl From<common::CommonError> for ReceiptError {
+    fn from(error: common::CommonError) -> Self {
+        match error {
+            common::CommonError::NotAuthorized => ReceiptError::NotAuthorized,
+            common::CommonError::NoPendingAdmin => ReceiptError::NoPendingAdmin,
+        }
+    }
 }
 
 #[contract]
@@ -115,31 +158,55 @@ pub struct ReceiptBook;
 impl ReceiptBook {
     /// Sets the admin and the minter. Callable exactly once.
     ///
-    /// `minter` is the voucher contract address. Because the voucher
-    /// contract must be deployed before it can be named here, and the
-    /// voucher contract needs this address at its own initialization,
-    /// deploy order is: receipt, voucher, then `set_minter`.
+    /// `minter` is the voucher contract address. Contract instances are
+    /// deployed before either is initialised, so the voucher address is known
+    /// here; changing it later goes through `propose_minter` and
+    /// `accept_minter`.
     pub fn initialize(env: Env, admin: Address, minter: Address) -> Result<(), ReceiptError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(ReceiptError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Minter, &minter);
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
+        common::extend_instance(&env);
         Initialized { admin }.publish(&env);
         Ok(())
     }
 
-    /// Repoints the minter at a newly deployed voucher contract. Admin only.
-    pub fn set_minter(env: Env, admin: Address, minter: Address) -> Result<(), ReceiptError> {
+    /// Nominates a new minter. Takes effect only once they accept.
+    ///
+    /// Two steps so a typo in the new address cannot let the wrong contract
+    /// mint receipts, or stop receipts entirely. Proposing again replaces the
+    /// earlier nominee. `minter` is normally a redeployed voucher contract.
+    pub fn propose_minter(
+        env: Env,
+        admin: Address,
+        new_minter: Address,
+    ) -> Result<(), ReceiptError> {
         Self::require_admin(&env, &admin)?;
-        env.storage().instance().set(&DataKey::Minter, &minter);
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
-        MinterChanged { minter }.publish(&env);
+        common::propose_admin(&env, &DataKey::PendingMinter, &new_minter);
+        MinterProposed {
+            admin,
+            pending_minter: new_minter,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// The nominated address accepts and becomes the minter.
+    pub fn accept_minter(env: Env, new_minter: Address) -> Result<(), ReceiptError> {
+        let new_minter =
+            match common::take_pending_admin(&env, &DataKey::PendingMinter, &new_minter) {
+                Ok(minter) => minter,
+                // The shared helper names the missing nomination after the admin
+                // slot; for this role callers expect the minter-specific code.
+                Err(common::CommonError::NoPendingAdmin) => {
+                    return Err(ReceiptError::NoPendingMinter)
+                }
+                Err(error) => return Err(error.into()),
+            };
+        env.storage().instance().set(&DataKey::Minter, &new_minter);
+        MinterChanged { minter: new_minter }.publish(&env);
         Ok(())
     }
 
@@ -182,20 +249,30 @@ impl ReceiptBook {
             settled_at,
         };
         env.storage().persistent().set(&key, &receipt);
-        env.storage().persistent().extend_ttl(
-            &key,
-            PERSISTENT_TTL_THRESHOLD,
-            PERSISTENT_TTL_EXTEND,
-        );
+        common::extend_persistent(&env, &key);
 
         let count_key = DataKey::Count(beneficiary_ref.clone());
         let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
         env.storage().persistent().set(&count_key, &(count + 1));
-        env.storage().persistent().extend_ttl(
-            &count_key,
-            PERSISTENT_TTL_THRESHOLD,
-            PERSISTENT_TTL_EXTEND,
-        );
+        common::extend_persistent(&env, &count_key);
+
+        // Per-provider index, in mint order. A clinic reads its own history
+        // from here without an indexer, and two clinics never share a list.
+        let provider_count_key = DataKey::ProviderCount(provider.clone());
+        let provider_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&provider_count_key)
+            .unwrap_or(0);
+        let provider_entry_key = DataKey::ProviderReceipt(provider.clone(), provider_count);
+        env.storage()
+            .persistent()
+            .set(&provider_entry_key, &voucher_id);
+        common::extend_persistent(&env, &provider_entry_key);
+        env.storage()
+            .persistent()
+            .set(&provider_count_key, &(provider_count + 1));
+        common::extend_persistent(&env, &provider_count_key);
 
         ReceiptMinted {
             beneficiary_ref,
@@ -212,12 +289,7 @@ impl ReceiptBook {
     /// Nominates a new admin. Takes effect only once they accept.
     pub fn propose_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), ReceiptError> {
         Self::require_admin(&env, &admin)?;
-        env.storage()
-            .instance()
-            .set(&DataKey::PendingAdmin, &new_admin);
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
+        common::propose_admin(&env, &DataKey::PendingAdmin, &new_admin);
         AdminProposed {
             admin,
             pending_admin: new_admin,
@@ -228,27 +300,18 @@ impl ReceiptBook {
 
     /// The nominated address accepts and becomes admin.
     pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), ReceiptError> {
-        let pending: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::PendingAdmin)
-            .ok_or(ReceiptError::NoPendingAdmin)?;
-        if pending != new_admin {
-            return Err(ReceiptError::NotAuthorized);
-        }
-        new_admin.require_auth();
-
+        let new_admin = common::take_pending_admin(&env, &DataKey::PendingAdmin, &new_admin)?;
         env.storage().instance().set(&DataKey::Admin, &new_admin);
-        env.storage().instance().remove(&DataKey::PendingAdmin);
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
         AdminChanged { new_admin }.publish(&env);
         Ok(())
     }
 
     pub fn get_pending_admin(env: Env) -> Option<Address> {
-        env.storage().instance().get(&DataKey::PendingAdmin)
+        common::read_pending_admin(&env, &DataKey::PendingAdmin)
+    }
+
+    pub fn get_pending_minter(env: Env) -> Option<Address> {
+        common::read_pending_admin(&env, &DataKey::PendingMinter)
     }
 
     pub fn get_receipt(env: Env, voucher_id: u64) -> Result<Receipt, ReceiptError> {
@@ -258,20 +321,93 @@ impl ReceiptBook {
             .persistent()
             .get(&key)
             .ok_or(ReceiptError::ReceiptNotFound)?;
-        env.storage().persistent().extend_ttl(
-            &key,
-            PERSISTENT_TTL_THRESHOLD,
-            PERSISTENT_TTL_EXTEND,
-        );
+        common::extend_persistent(&env, &key);
         Ok(receipt)
     }
 
     /// How many settled care episodes this beneficiary reference has.
+    ///
+    /// Extends the counter's TTL like every other persistent read: a patient
+    /// who keeps being treated must not have their history archived out from
+    /// under them because only the receipt entries were being extended.
     pub fn count_for(env: Env, beneficiary_ref: BytesN<32>) -> u32 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Count(beneficiary_ref))
-            .unwrap_or(0)
+        let key = DataKey::Count(beneficiary_ref);
+        match env.storage().persistent().get::<_, u32>(&key) {
+            Some(count) => {
+                common::extend_persistent(&env, &key);
+                count
+            }
+            None => 0,
+        }
+    }
+
+    /// A clinic's receipts in mint order, newest last.
+    ///
+    /// `start` is the index of the first receipt to return; `limit` is capped
+    /// at `MAX_RECEIPTS_PAGE` so one read cannot exceed host limits. Page by
+    /// calling again with `start += returned.len()`. A provider with no
+    /// receipts returns an empty list, and one clinic's index never includes
+    /// another clinic's receipts.
+    pub fn receipts_of_provider(
+        env: Env,
+        provider: Address,
+        start: u32,
+        limit: u32,
+    ) -> Vec<Receipt> {
+        let mut out = Vec::new(&env);
+        let limit = limit.min(MAX_RECEIPTS_PAGE);
+        if limit == 0 {
+            return out;
+        }
+
+        let count_key = DataKey::ProviderCount(provider.clone());
+        let total: u32 = match env.storage().persistent().get(&count_key) {
+            Some(total) => total,
+            None => return out,
+        };
+        common::extend_persistent(&env, &count_key);
+
+        if start >= total {
+            return out;
+        }
+        let end = start.saturating_add(limit).min(total);
+        for index in start..end {
+            let entry_key = DataKey::ProviderReceipt(provider.clone(), index);
+            if let Some(voucher_id) = env.storage().persistent().get::<_, u64>(&entry_key) {
+                common::extend_persistent(&env, &entry_key);
+                // A missing receipt would mean a broken index; skip it rather
+                // than failing the whole page.
+                if let Ok(receipt) = Self::get_receipt(env.clone(), voucher_id) {
+                    out.push_back(receipt);
+                }
+            }
+        }
+        out
+    }
+
+    /// Human-readable name shown by wallets and explorers.
+    ///
+    /// Read-only view, no signature required. Receipts are soulbound: there is
+    /// no transfer function, so a receipt stays bound to the beneficiary
+    /// reference it was minted against.
+    pub fn name(env: Env) -> String {
+        String::from_str(&env, RECEIPT_NAME)
+    }
+
+    /// Token-style symbol shown by wallets and explorers.
+    ///
+    /// Read-only view, no signature required. Receipts are soulbound.
+    pub fn symbol(env: Env) -> String {
+        String::from_str(&env, RECEIPT_SYMBOL)
+    }
+
+    /// Read-only, per-receipt URI for explorers and wallets.
+    ///
+    /// The URI is derived only from `voucher_id`. It contains no patient or
+    /// beneficiary data — it is an opaque pointer to the receipt, not the
+    /// care record itself. No signature required.
+    pub fn receipt_uri(env: Env, voucher_id: u64) -> String {
+        String::from_str(&env, &alloc::format!("{}{}", RECEIPT_URI_BASE, voucher_id))
     }
 
     pub fn get_minter(env: Env) -> Result<Address, ReceiptError> {
@@ -288,16 +424,18 @@ impl ReceiptBook {
             .ok_or(ReceiptError::NotInitialized)
     }
 
+    /// Crate version this contract was built from, e.g. `"0.2.0"`.
+    ///
+    /// Lets integrators and the indexer tell deployments apart without
+    /// comparing wasm hashes.
+    pub fn version(env: Env) -> String {
+        String::from_str(&env, env!("CARGO_PKG_VERSION"))
+    }
+
     fn require_admin(env: &Env, admin: &Address) -> Result<(), ReceiptError> {
-        let stored: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(ReceiptError::NotInitialized)?;
-        if stored != *admin {
-            return Err(ReceiptError::NotAuthorized);
-        }
-        admin.require_auth();
+        let stored: Address =
+            common::read_admin(env, &DataKey::Admin).ok_or(ReceiptError::NotInitialized)?;
+        common::require_admin(&stored, admin)?;
         Ok(())
     }
 }

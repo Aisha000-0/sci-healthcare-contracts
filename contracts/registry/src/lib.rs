@@ -1,4 +1,9 @@
 #![no_std]
+// A panic aborts the whole invocation with an opaque host error. Contract
+// code must return a typed error instead, so both are denied outside tests.
+// Tests keep them for brevity: they are fail-fast assertions, not contract
+// behaviour.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 //! # SCI Healthcare — Provider Registry
 //!
@@ -17,19 +22,25 @@ mod types;
 #[cfg(test)]
 mod test;
 
+use sci_common as common;
 use soroban_sdk::{contract, contractimpl, Address, Env, String, Vec};
 
 pub use events::{
     AdminChanged, AdminProposed, AttesterAdded, AttesterRemoved, Initialized, ProviderRegistered,
-    ProviderStatusChanged, ServiceRemoved, ServiceUpserted,
+    ProviderStatusChanged, ServiceAvailabilityChanged, ServicePriceScheduled, ServiceRemoved,
+    ServiceUpserted,
 };
 pub use types::{DataKey, Provider, ProviderStatus, RegistryError, ServiceItem};
 
 use storage::{
-    clear_pending_admin, extend_instance, has_admin, has_provider, read_admin, read_attester,
-    read_pending_admin, read_provider, read_service, remove_service as storage_remove_service,
-    write_admin, write_attester, write_pending_admin, write_provider, write_service,
+    extend_instance, has_admin, has_provider, read_admin, read_attester, read_pending_admin,
+    read_provider, read_service, remove_service as storage_remove_service, write_admin,
+    write_attester, write_provider, write_service,
 };
+
+/// Least notice a clinic must give before a scheduled price takes effect.
+/// 24 hours, so a funder who has just seen a price can still pay it.
+pub const MIN_PRICE_NOTICE_SECS: u64 = 24 * 60 * 60;
 
 #[contract]
 pub struct Registry;
@@ -117,6 +128,12 @@ impl Registry {
     ///
     /// Only an `Active` provider may maintain a catalog, so a suspended
     /// clinic cannot quietly re-price itself back into circulation.
+    ///
+    /// A new service is listed at `price` straight away, and so is a lower
+    /// price for an existing one. Raising an existing price is rejected with
+    /// `PriceIncreaseNeedsNotice`: use `schedule_service_price`, so a funder
+    /// never sees one price and finds another minutes later. A price already
+    /// scheduled is left in place.
     pub fn upsert_service(
         env: Env,
         provider_addr: Address,
@@ -138,11 +155,29 @@ impl Registry {
             return Err(RegistryError::ProviderNotActive);
         }
 
-        let item = ServiceItem {
-            code,
-            label: label.clone(),
-            price,
-            active: true,
+        let item = match read_service(&env, &provider_addr, code) {
+            Ok(existing) => {
+                if price > existing.price {
+                    return Err(RegistryError::PriceIncreaseNeedsNotice);
+                }
+                // Re-pricing or relabelling a paused service must not quietly
+                // put it back on sale; only `set_service_available` does that.
+                ServiceItem {
+                    label: label.clone(),
+                    price,
+                    active: true,
+                    ..existing
+                }
+            }
+            Err(_) => ServiceItem {
+                code,
+                label: label.clone(),
+                price,
+                active: true,
+                available: true,
+                pending_price: 0,
+                effective_at: 0,
+            },
         };
         write_service(&env, &provider_addr, code, &item);
         extend_instance(&env);
@@ -152,6 +187,54 @@ impl Registry {
             code,
             label,
             price,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Schedules a new price for a listed service, effective at `effective_at`.
+    ///
+    /// The time must be at least `MIN_PRICE_NOTICE_SECS` away, so apps can
+    /// warn funders before it lands. Until then `get_service_price` keeps
+    /// returning the current price; from then on it returns this one.
+    /// Scheduling again replaces the earlier schedule, and scheduling the
+    /// current price is how a clinic calls one off.
+    pub fn schedule_service_price(
+        env: Env,
+        provider_addr: Address,
+        code: u32,
+        price: i128,
+        effective_at: u64,
+    ) -> Result<(), RegistryError> {
+        provider_addr.require_auth();
+
+        if price <= 0 {
+            return Err(RegistryError::InvalidPrice);
+        }
+        let provider = read_provider(&env, &provider_addr)?;
+        if provider.status != ProviderStatus::Active {
+            return Err(RegistryError::ProviderNotActive);
+        }
+        let mut item = read_service(&env, &provider_addr, code)?;
+
+        let earliest = env
+            .ledger()
+            .timestamp()
+            .saturating_add(MIN_PRICE_NOTICE_SECS);
+        if effective_at < earliest {
+            return Err(RegistryError::PriceNoticeTooShort);
+        }
+
+        item.pending_price = price;
+        item.effective_at = effective_at;
+        write_service(&env, &provider_addr, code, &item);
+        extend_instance(&env);
+
+        ServicePriceScheduled {
+            provider: provider_addr,
+            code,
+            price,
+            effective_at,
         }
         .publish(&env);
         Ok(())
@@ -176,6 +259,32 @@ impl Registry {
         ServiceRemoved {
             provider: provider_addr,
             code,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Pauses or resumes a service without delisting it.
+    ///
+    /// While paused, `voucher` refuses to fund the service. Vouchers already
+    /// funded against it are unaffected and settle normally.
+    pub fn set_service_available(
+        env: Env,
+        provider_addr: Address,
+        code: u32,
+        available: bool,
+    ) -> Result<(), RegistryError> {
+        provider_addr.require_auth();
+
+        let mut item = read_service(&env, &provider_addr, code)?;
+        item.available = available;
+        write_service(&env, &provider_addr, code, &item);
+        extend_instance(&env);
+
+        ServiceAvailabilityChanged {
+            provider: provider_addr,
+            code,
+            available,
         }
         .publish(&env);
         Ok(())
@@ -213,8 +322,7 @@ impl Registry {
         new_admin: Address,
     ) -> Result<(), RegistryError> {
         Self::require_admin(&env, &admin)?;
-        write_pending_admin(&env, &new_admin);
-        extend_instance(&env);
+        common::propose_admin(&env, &DataKey::PendingAdmin, &new_admin);
         AdminProposed {
             admin,
             pending_admin: new_admin,
@@ -225,15 +333,8 @@ impl Registry {
 
     /// The nominated address accepts and becomes admin.
     pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), RegistryError> {
-        let pending = read_pending_admin(&env).ok_or(RegistryError::NoPendingAdmin)?;
-        if pending != new_admin {
-            return Err(RegistryError::NotAuthorized);
-        }
-        new_admin.require_auth();
-
+        let new_admin = common::take_pending_admin(&env, &DataKey::PendingAdmin, &new_admin)?;
         write_admin(&env, &new_admin);
-        clear_pending_admin(&env);
-        extend_instance(&env);
         AdminChanged { new_admin }.publish(&env);
         Ok(())
     }
@@ -286,6 +387,11 @@ impl Registry {
 
     /// Price for a provider's service, or 0 if absent or inactive.
     ///
+    /// A scheduled price is returned from its `effective_at` onwards.
+    ///
+    /// A paused service still reports its price, so `voucher` can tell
+    /// "not offered" apart from "temporarily unavailable".
+    ///
     /// Returns a primitive rather than a struct so the voucher contract can
     /// validate pricing over a cross-contract interface without having to
     /// redeclare this contract's types.
@@ -296,18 +402,43 @@ impl Registry {
         }
     }
 
+    /// The scheduled price and when it takes effect, or `(0, 0)` if no
+    /// change is pending. Lets apps warn funders about an upcoming price.
+    pub fn get_upcoming_price(
+        env: Env,
+        provider_addr: Address,
+        code: u32,
+    ) -> Result<(i128, u64), RegistryError> {
+        let item = read_service(&env, &provider_addr, code)?;
+        Ok((item.pending_price, item.effective_at))
+    }
+
+    /// Whether the service is listed, active and not paused — the second
+    /// check `voucher` makes before escrowing, after the price.
+    pub fn is_service_available(env: Env, provider_addr: Address, code: u32) -> bool {
+        match read_service(&env, &provider_addr, code) {
+            Ok(item) => item.active && item.available,
+            Err(_) => false,
+        }
+    }
+
     pub fn is_attester(env: Env, addr: Address) -> bool {
         read_attester(&env, &addr)
+    }
+
+    /// Crate version this contract was built from, e.g. `"0.2.0"`.
+    ///
+    /// Lets integrators and the indexer tell deployments apart without
+    /// comparing wasm hashes.
+    pub fn version(env: Env) -> String {
+        String::from_str(&env, env!("CARGO_PKG_VERSION"))
     }
 
     // ----- internal -----
 
     fn require_admin(env: &Env, admin: &Address) -> Result<(), RegistryError> {
         let stored = read_admin(env)?;
-        if stored != *admin {
-            return Err(RegistryError::NotAuthorized);
-        }
-        admin.require_auth();
+        common::require_admin(&stored, admin)?;
         Ok(())
     }
 }

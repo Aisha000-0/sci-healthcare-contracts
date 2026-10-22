@@ -36,6 +36,10 @@ pub struct VoucherClaimed {
     pub provider: Address,
     pub voucher_id: u64,
     pub claimed_at: u64,
+    /// Appended, after the original fields: what was claimed, in the
+    /// voucher's own event, so a single event needs no storage lookup.
+    pub service_code: u32,
+    pub amount: i128,
 }
 
 #[contractevent]
@@ -46,6 +50,12 @@ pub struct VoucherAttested {
     pub voucher_id: u64,
     pub attested_at: u64,
     pub dispute_deadline: u64,
+    /// Appended, after the original fields; see `VoucherClaimed`.
+    pub service_code: u32,
+    pub amount: i128,
+    /// Appended: attestations this attester has left today (UTC), so a
+    /// burst from one key is visible to the indexer as it happens.
+    pub remaining_today: u32,
 }
 
 #[contractevent]
@@ -55,6 +65,9 @@ pub struct VoucherDisputed {
     pub funder: Address,
     pub voucher_id: u64,
     pub reason_code: u32,
+    /// Appended, after the original fields; see `VoucherClaimed`.
+    pub service_code: u32,
+    pub amount: i128,
 }
 
 #[contractevent]
@@ -65,6 +78,13 @@ pub struct VoucherSettled {
     pub voucher_id: u64,
     pub net: i128,
     pub fee: i128,
+    /// Appended, after the original fields: the gross amount escrowed,
+    /// beside the `net` and `fee` that were paid out.
+    pub service_code: u32,
+    pub amount: i128,
+    /// Appended: the part of `fee` routed to the attester. The fee account
+    /// received `fee - attester_share`, so `net + fee == amount`.
+    pub attester_share: i128,
 }
 
 #[contractevent]
@@ -73,7 +93,27 @@ pub struct VoucherRefunded {
     #[topic]
     pub funder: Address,
     pub voucher_id: u64,
+    /// Already carried by this event; left where it is so existing
+    /// consumers keep reading the same field.
     pub amount: i128,
+    /// Appended, after the original fields; see `VoucherClaimed`.
+    pub service_code: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoucherAmountReduced {
+    #[topic]
+    pub funder: Address,
+    pub voucher_id: u64,
+    /// Appended, after the original fields; see `VoucherClaimed`.
+    pub service_code: u32,
+    /// The amount escrowed before this call.
+    pub previous_amount: i128,
+    /// The amount escrowed now.
+    pub amount: i128,
+    /// What went back to the funder: `previous_amount - amount`.
+    pub refunded: i128,
 }
 
 #[contractevent]
@@ -82,7 +122,24 @@ pub struct DisputeResolved {
     #[topic]
     pub admin: Address,
     pub voucher_id: u64,
+    /// `true` only when the funder received the whole voucher back.
     pub refunded_funder: bool,
+    /// Appended: the gross amount awarded to the clinic, before the fee.
+    /// Zero on a full refund, the whole voucher on a full payout, and
+    /// anything between for `resolve_split`.
+    pub to_provider: i128,
+    /// Appended: the protocol fee deducted from `to_provider`.
+    pub fee: i128,
+    /// Appended: the remainder returned to the funder.
+    pub to_funder: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttestationCapChanged {
+    #[topic]
+    pub admin: Address,
+    pub cap: u32,
 }
 
 #[contractevent]

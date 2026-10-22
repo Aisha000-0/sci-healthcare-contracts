@@ -226,6 +226,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "available"
+                    },
+                    "val": {
+                      "bool": true
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "code"
                     },
                     "val": {
@@ -234,10 +242,26 @@
                   },
                   {
                     "key": {
+                      "symbol": "effective_at"
+                    },
+                    "val": {
+                      "u64": "0"
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "label"
                     },
                     "val": {
                       "string": "Consult"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "pending_price"
+                    },
+                    "val": {
+                      "i128": "0"
                     }
                   },
                   {
@@ -289,6 +313,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "available"
+                    },
+                    "val": {
+                      "bool": true
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "code"
                     },
                     "val": {
@@ -297,10 +329,26 @@
                   },
                   {
                     "key": {
+                      "symbol": "effective_at"
+                    },
+                    "val": {
+                      "u64": "0"
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "label"
                     },
                     "val": {
                       "string": "Malaria RDT"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "pending_price"
+                    },
+                    "val": {
+                      "i128": "0"
                     }
                   },
                   {

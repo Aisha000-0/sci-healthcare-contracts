@@ -1,14 +1,18 @@
 #![cfg(test)]
+extern crate std;
 
+use soroban_sdk::xdr::{ContractEvent, ContractEventBody, ScVal};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
-    token, Address, Env,
+    testutils::{Address as _, Events as _, Ledger as _},
+    token, Address, Env, String,
 };
 
 use crate::{Faucet, FaucetClient, FaucetError};
 
 const DRIP: i128 = 500_000_000; // 50 USDC at 7 decimals
 const COOLDOWN: u64 = 24 * 60 * 60;
+/// Two drips per day across every address combined.
+const DAILY_CAP: i128 = 2 * DRIP;
 const START_TIME: u64 = 1_700_000_000;
 
 struct Fixture {
@@ -21,6 +25,10 @@ struct Fixture {
 }
 
 fn setup() -> Fixture {
+    setup_with_caps(DAILY_CAP, 0)
+}
+
+fn setup_with_caps(daily_cap: i128, lifetime_cap: i128) -> Fixture {
     let env = Env::default();
     env.mock_all_auths();
     env.ledger().with_mut(|li| li.timestamp = START_TIME);
@@ -32,7 +40,14 @@ fn setup() -> Fixture {
 
     let faucet_addr = env.register(Faucet, ());
     let faucet = FaucetClient::new(&env, &faucet_addr);
-    faucet.initialize(&admin, &token_addr, &DRIP, &COOLDOWN);
+    faucet.initialize(
+        &admin,
+        &token_addr,
+        &DRIP,
+        &COOLDOWN,
+        &daily_cap,
+        &lifetime_cap,
+    );
 
     // The issuer hands token administration to the faucet, as on testnet.
     let sac = token::StellarAssetClient::new(&env, &token_addr);
@@ -99,6 +114,70 @@ fn cooldown_is_per_address() {
 }
 
 #[test]
+fn daily_cap_limits_total_minted_per_day() {
+    let f = setup();
+    let a = Address::generate(&f.env);
+    let b = Address::generate(&f.env);
+    let c = Address::generate(&f.env);
+
+    f.faucet.drip(&a);
+    f.faucet.drip(&b);
+    assert_eq!(f.token.balance(&a), DRIP);
+    assert_eq!(f.token.balance(&b), DRIP);
+
+    // DAILY_CAP is two drips: a third address is rejected even though it has
+    // never dripped before.
+    let err = f.faucet.try_drip(&c).err().unwrap().unwrap();
+    assert_eq!(err, FaucetError::DailyCapReached);
+    assert_eq!(f.token.balance(&c), 0);
+}
+
+#[test]
+fn daily_cap_resets_at_day_boundary() {
+    let f = setup();
+    let user = Address::generate(&f.env);
+    let other = Address::generate(&f.env);
+
+    f.faucet.drip(&user);
+    f.faucet.drip(&other); // shared cap of two drips reached
+    assert!(f.faucet.try_drip(&user).is_err());
+    assert!(f.faucet.try_drip(&other).is_err());
+
+    // The next UTC day: the shared counter resets and drips resume.
+    advance(&f.env, 24 * 60 * 60 + 1);
+    f.faucet.drip(&user);
+    assert_eq!(f.token.balance(&user), 2 * DRIP);
+    assert_eq!(f.token.balance(&other), DRIP);
+}
+
+#[test]
+fn paused_faucet_rejects_drips() {
+    let f = setup();
+    let user = Address::generate(&f.env);
+
+    f.faucet.set_paused(&f.admin, &true);
+    let err = f.faucet.try_drip(&user).err().unwrap().unwrap();
+    assert_eq!(err, FaucetError::Paused);
+
+    f.faucet.set_paused(&f.admin, &false);
+    f.faucet.drip(&user);
+    assert_eq!(f.token.balance(&user), DRIP);
+}
+
+#[test]
+fn non_admin_cannot_pause() {
+    let f = setup();
+    let impostor = Address::generate(&f.env);
+    let err = f
+        .faucet
+        .try_set_paused(&impostor, &true)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, FaucetError::NotAuthorized);
+}
+
+#[test]
 fn admin_can_change_the_drip() {
     let f = setup();
     f.faucet.set_drip(&f.admin, &10i128, &0u64);
@@ -158,14 +237,195 @@ fn non_admin_cannot_take_the_token() {
 }
 
 #[test]
+fn version_is_the_crate_version() {
+    let f = setup();
+    let version = f.faucet.version();
+    assert_eq!(version, String::from_str(&f.env, env!("CARGO_PKG_VERSION")));
+    // Every contract shares the workspace version.
+    assert_eq!(version, String::from_str(&f.env, "0.2.0"));
+}
+
+#[test]
 fn initialize_is_single_shot() {
     let f = setup();
     let a = Address::generate(&f.env);
     let err = f
         .faucet
-        .try_initialize(&a, &a, &DRIP, &COOLDOWN)
+        .try_initialize(&a, &a, &DRIP, &COOLDOWN, &DAILY_CAP, &0i128)
         .err()
         .unwrap()
         .unwrap();
     assert_eq!(err, FaucetError::AlreadyInitialized);
+}
+
+#[test]
+fn zero_daily_cap_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let issuer = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(issuer.clone());
+    let token_addr = asset.address();
+    let faucet_addr = env.register(Faucet, ());
+    let faucet = FaucetClient::new(&env, &faucet_addr);
+
+    let err = faucet
+        .try_initialize(&admin, &token_addr, &DRIP, &COOLDOWN, &0i128, &0i128)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, FaucetError::InvalidAmount);
+}
+
+#[test]
+fn lifetime_cap_is_enforced_across_days() {
+    // Two drips per address, ever, with room in the shared daily cap.
+    let f = setup_with_caps(10 * DRIP, 2 * DRIP);
+    let user = Address::generate(&f.env);
+
+    f.faucet.drip(&user);
+    advance(&f.env, COOLDOWN);
+    f.faucet.drip(&user);
+
+    // Another day and another cooldown do not reset a lifetime cap.
+    advance(&f.env, 24 * 60 * 60 + 1);
+    let err = f.faucet.try_drip(&user).err().unwrap().unwrap();
+    assert_eq!(err, FaucetError::LifetimeCapReached);
+    assert_eq!(f.token.balance(&user), 2 * DRIP);
+}
+
+#[test]
+fn lifetime_cap_is_per_address() {
+    let f = setup_with_caps(10 * DRIP, DRIP);
+    let capped = Address::generate(&f.env);
+    let other = Address::generate(&f.env);
+
+    f.faucet.drip(&capped);
+    advance(&f.env, COOLDOWN);
+    let err = f.faucet.try_drip(&capped).err().unwrap().unwrap();
+    assert_eq!(err, FaucetError::LifetimeCapReached);
+
+    // A different address still has its own allowance.
+    assert_eq!(f.faucet.drip(&other), DRIP);
+    assert_eq!(f.token.balance(&other), DRIP);
+}
+
+#[test]
+fn zero_lifetime_cap_means_unlimited() {
+    let f = setup_with_caps(10 * DRIP, 0);
+    let user = Address::generate(&f.env);
+
+    for _ in 0..5 {
+        f.faucet.drip(&user);
+        advance(&f.env, COOLDOWN);
+    }
+    assert_eq!(f.token.balance(&user), 5 * DRIP);
+}
+
+#[test]
+fn negative_lifetime_cap_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let issuer = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(issuer);
+    let token_addr = asset.address();
+    let faucet_addr = env.register(Faucet, ());
+    let faucet = FaucetClient::new(&env, &faucet_addr);
+
+    let err = faucet
+        .try_initialize(&admin, &token_addr, &DRIP, &COOLDOWN, &DAILY_CAP, &-1i128)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, FaucetError::InvalidAmount);
+}
+
+// ----- event assertions -----
+
+fn symbol_of(v: &ScVal) -> Option<&str> {
+    match v {
+        ScVal::Symbol(s) => (&s.0).try_into().ok(),
+        _ => None,
+    }
+}
+
+/// The events published by `contract` so far.
+fn faucet_events(env: &Env, contract: &Address) -> std::vec::Vec<ContractEvent> {
+    let events = env.events().all().filter_by_contract(contract);
+    std::vec::Vec::from(events.events())
+}
+
+/// The name carried in topic 0 of the last faucet event.
+fn last_event_name(env: &Env, contract: &Address) -> std::string::String {
+    let list = faucet_events(env, contract);
+    let last = list.last().unwrap();
+    match &last.body {
+        ContractEventBody::V0(v0) => match &v0.topics[0] {
+            ScVal::Symbol(s) => std::string::String::from_utf8_lossy(&s.0).into_owned(),
+            other => panic!("event topic 0 is not a symbol: {other:?}"),
+        },
+    }
+}
+
+/// One data-map field of the last faucet event.
+fn last_event_field(env: &Env, contract: &Address, name: &str) -> ScVal {
+    let list = faucet_events(env, contract);
+    let last = list.last().unwrap();
+    match &last.body {
+        ContractEventBody::V0(v0) => match &v0.data {
+            ScVal::Map(Some(map)) => map
+                .iter()
+                .find(|entry| symbol_of(&entry.key) == Some(name))
+                .map(|entry| entry.val.clone())
+                .unwrap_or_else(|| panic!("last event has no `{name}` field")),
+            _ => panic!("last event data is not a map"),
+        },
+    }
+}
+
+fn last_event_i128(env: &Env, contract: &Address, name: &str) -> i128 {
+    match last_event_field(env, contract, name) {
+        ScVal::I128(parts) => i128::from(&parts),
+        other => panic!("event field `{name}` is {other:?}, want i128"),
+    }
+}
+
+fn last_event_u64(env: &Env, contract: &Address, name: &str) -> u64 {
+    match last_event_field(env, contract, name) {
+        ScVal::U64(v) => v,
+        other => panic!("event field `{name}` is {other:?}, want u64"),
+    }
+}
+
+#[test]
+fn set_drip_emits_drip_changed_event() {
+    let f = setup();
+    let contract = &f.faucet.address;
+    f.faucet.set_drip(&f.admin, &10i128, &0u64);
+
+    let events = faucet_events(&f.env, contract);
+    assert_eq!(events.len(), 1, "set_drip must publish exactly one event");
+    assert_eq!(last_event_name(&f.env, contract), "drip_changed");
+    assert_eq!(last_event_i128(&f.env, contract, "amount"), 10);
+    assert_eq!(last_event_u64(&f.env, contract, "cooldown"), 0);
+}
+
+#[test]
+fn not_initialized_errors() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = START_TIME);
+    let a = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(issuer);
+    let _token_addr = asset.address();
+    let faucet_addr = env.register(Faucet, ());
+    let faucet = FaucetClient::new(&env, &faucet_addr);
+
+    // Any call before initialize should return NotInitialized.
+    let err = faucet.try_get_config().err().unwrap().unwrap();
+    assert_eq!(err, FaucetError::NotInitialized);
+    let err = faucet.try_drip(&a).err().unwrap().unwrap();
+    assert_eq!(err, FaucetError::NotInitialized);
 }
