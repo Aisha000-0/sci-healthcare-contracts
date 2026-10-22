@@ -323,6 +323,126 @@ fn cannot_fund_paused_service() {
     assert_eq!(fund(&f), 1);
 }
 
+// ----- redirecting a funded voucher -----
+
+fn register_redirect_provider(f: &Fixture) -> Address {
+    let provider = Address::generate(&f.env);
+    f.registry.register_provider(
+        &provider,
+        &String::from_str(&f.env, "New Clinic"),
+        &String::from_str(&f.env, "NG"),
+    );
+    f.registry
+        .set_provider_status(&f.admin, &provider, &ProviderStatus::Active);
+    provider
+}
+
+#[test]
+fn redirect_moves_a_funded_voucher_and_emits_event() {
+    let f = setup();
+    let id = fund(&f);
+    let new_provider = register_redirect_provider(&f);
+    f.registry.upsert_service(
+        &new_provider,
+        &CONSULT,
+        &String::from_str(&f.env, "Outpatient consult"),
+        &CONSULT_PRICE,
+    );
+
+    f.voucher.redirect(&f.funder, &id, &new_provider);
+
+    let e = one_event(&f);
+    assert_layout(
+        &e,
+        "voucher_redirected",
+        &[ScVal::from(&f.funder), ScVal::from(&new_provider)],
+        &["voucher_id", "previous_provider", "service_code"],
+    );
+    assert_eq!(field_u64(&e, "voucher_id"), id);
+    assert_eq!(field_u32(&e, "service_code"), CONSULT);
+    assert_eq!(field(&e, "previous_provider"), ScVal::from(&f.provider));
+
+    let voucher = f.voucher.get_voucher(&id);
+    assert_eq!(voucher.provider, new_provider);
+    assert_eq!(voucher.status, VoucherStatus::Funded);
+    assert_eq!(voucher.amount, CONSULT_PRICE);
+}
+
+#[test]
+fn cannot_redirect_to_an_inactive_provider() {
+    let f = setup();
+    let id = fund(&f);
+    let new_provider = register_redirect_provider(&f);
+    f.registry
+        .set_provider_status(&f.admin, &new_provider, &ProviderStatus::Suspended);
+
+    let err = f
+        .voucher
+        .try_redirect(&f.funder, &id, &new_provider)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VoucherError::ProviderNotActive);
+}
+
+#[test]
+fn cannot_redirect_to_a_provider_without_the_service() {
+    let f = setup();
+    let id = fund(&f);
+    let new_provider = register_redirect_provider(&f);
+
+    let err = f
+        .voucher
+        .try_redirect(&f.funder, &id, &new_provider)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VoucherError::ServiceNotOffered);
+}
+
+#[test]
+fn cannot_redirect_when_new_provider_price_exceeds_voucher_amount() {
+    let f = setup();
+    let id = fund(&f);
+    let new_provider = register_redirect_provider(&f);
+    f.registry.upsert_service(
+        &new_provider,
+        &CONSULT,
+        &String::from_str(&f.env, "Outpatient consult"),
+        &(CONSULT_PRICE + 1),
+    );
+
+    let err = f
+        .voucher
+        .try_redirect(&f.funder, &id, &new_provider)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VoucherError::AmountBelowPrice);
+}
+
+#[test]
+fn cannot_redirect_a_claimed_voucher() {
+    let f = setup();
+    let id = fund(&f);
+    f.voucher.claim(&f.provider, &id);
+    let new_provider = register_redirect_provider(&f);
+    f.registry.upsert_service(
+        &new_provider,
+        &CONSULT,
+        &String::from_str(&f.env, "Outpatient consult"),
+        &CONSULT_PRICE,
+    );
+
+    let err = f
+        .voucher
+        .try_redirect(&f.funder, &id, &new_provider)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VoucherError::InvalidStatus);
+}
+
 #[test]
 fn pausing_a_service_does_not_affect_funded_vouchers() {
     let f = setup();
@@ -2275,6 +2395,10 @@ const AUTH_MATRIX: &[AuthCase] = &[
         auth: signer("`funder`", funder_addr),
     },
     AuthCase {
+        function: "redirect",
+        auth: signer("`funder`", funder_addr),
+    },
+    AuthCase {
         function: "claim",
         auth: signer("`provider`", provider_addr),
     },
@@ -2397,6 +2521,24 @@ fn run_case(f: &AuthFixture, function: &str) -> std::vec::Vec<Address> {
         "reduce_amount" => {
             let id = fund_overpaid(&f.f, CONSULT_PRICE * 2);
             voucher.reduce_amount(&f.f.funder, &id, &CONSULT_PRICE);
+        }
+        "redirect" => {
+            let id = fund(&f.f);
+            let provider = Address::generate(env);
+            f.f.registry.register_provider(
+                &provider,
+                &String::from_str(env, "New Clinic"),
+                &String::from_str(env, "NG"),
+            );
+            f.f.registry
+                .set_provider_status(&f.f.admin, &provider, &ProviderStatus::Active);
+            f.f.registry.upsert_service(
+                &provider,
+                &CONSULT,
+                &String::from_str(env, "Outpatient consult"),
+                &CONSULT_PRICE,
+            );
+            voucher.redirect(&f.f.funder, &id, &provider);
         }
         "claim" => {
             let id = fund(&f.f);
