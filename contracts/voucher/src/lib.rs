@@ -344,8 +344,7 @@ impl VoucherEscrow {
             return Err(VoucherError::NotYetExpired);
         }
 
-        Self::pay_back(&env, &config, &mut voucher);
-        Ok(())
+        Self::pay_back(&env, &config, &mut voucher)
     }
 
     /// Admin resolves a dispute. `refund_funder` picks the winner.
@@ -371,18 +370,20 @@ impl VoucherEscrow {
             return Err(VoucherError::InvalidStatus);
         }
 
+        if refund_funder {
+            Self::pay_back(&env, &config, &mut voucher)?;
+        } else {
+            Self::pay_out(&env, &config, &mut voucher)?;
+        }
+
+        // Published last: the event is only emitted for a resolution whose
+        // transfer actually landed.
         DisputeResolved {
             admin,
             voucher_id,
             refunded_funder: refund_funder,
         }
         .publish(&env);
-
-        if refund_funder {
-            Self::pay_back(&env, &config, &mut voucher);
-        } else {
-            Self::pay_out(&env, &config, &mut voucher)?;
-        }
         Ok(())
     }
 
@@ -482,29 +483,63 @@ impl VoucherEscrow {
     }
 
     /// Pays the provider, takes the fee, and mints the care receipt.
+    ///
+    /// The order is deliberate and is the same on every path:
+    ///
+    /// 1. **Effects first.** The voucher is written `Settled` before any
+    ///    external call, so a token — or a provider address that is a
+    ///    contract — that re-enters `settle` from inside the transfer sees a
+    ///    terminal status and cannot be paid a second time.
+    /// 2. **Interactions, each checked.** Both token transfers and the
+    ///    receipt mint are reported as typed errors instead of opaque host
+    ///    failures, and each transfer is measured: the escrow's balance must
+    ///    fall by exactly the amount sent, so a token that returns success
+    ///    without moving funds cannot mark a voucher paid.
+    /// 3. **Event last**, so `voucher_settled` is only emitted for a
+    ///    settlement that actually moved money.
+    ///
+    /// Any `Err` rolls the whole invocation back, including the status
+    /// write: a failed transfer or a failed mint leaves the voucher
+    /// `Attested` and the escrow untouched.
     fn pay_out(env: &Env, config: &Config, voucher: &mut Voucher) -> Result<(), VoucherError> {
         let fee = Self::fee_for(voucher.amount, config.fee_bps)?;
-        let net = voucher.amount - fee;
-
-        let token_client = token::Client::new(env, &config.token);
-        let escrow = env.current_contract_address();
-
-        token_client.transfer(&escrow, &voucher.provider, &net);
-        if fee > 0 {
-            token_client.transfer(&escrow, &config.fee_account, &fee);
-        }
+        let net = voucher
+            .amount
+            .checked_sub(fee)
+            .ok_or(VoucherError::MathOverflow)?;
 
         voucher.status = VoucherStatus::Settled;
         write_voucher(env, voucher);
 
-        ReceiptClient::new(env, &config.receipt_book).mint(
-            &escrow,
-            &voucher.id,
-            &voucher.beneficiary_ref,
-            &voucher.provider,
-            &voucher.service_code,
-            &voucher.amount,
-        );
+        let escrow = env.current_contract_address();
+        let token_client = token::Client::new(env, &config.token);
+
+        let paid = Self::transfer_from_escrow(&token_client, &escrow, &voucher.provider, net)?;
+        if paid != net {
+            return Err(VoucherError::TokenTransferFailed);
+        }
+        if fee > 0 {
+            let taken =
+                Self::transfer_from_escrow(&token_client, &escrow, &config.fee_account, fee)?;
+            if taken != fee {
+                return Err(VoucherError::TokenTransferFailed);
+            }
+        }
+
+        let receipts = ReceiptClient::new(env, &config.receipt_book);
+        if receipts
+            .try_mint(
+                &escrow,
+                &voucher.id,
+                &voucher.beneficiary_ref,
+                &voucher.provider,
+                &voucher.service_code,
+                &voucher.amount,
+            )
+            .is_err()
+        {
+            return Err(VoucherError::ReceiptMintFailed);
+        }
 
         VoucherSettled {
             provider: voucher.provider.clone(),
@@ -518,15 +553,21 @@ impl VoucherEscrow {
 
     /// Returns the full escrowed amount to the funder. No fee is taken on
     /// care that never happened.
-    fn pay_back(env: &Env, config: &Config, voucher: &mut Voucher) {
-        token::Client::new(env, &config.token).transfer(
-            &env.current_contract_address(),
-            &voucher.funder,
-            &voucher.amount,
-        );
-
+    ///
+    /// Same ordering as `pay_out`: status first, then a checked transfer,
+    /// then the event. A refused or silent transfer returns an error and the
+    /// refund — status included — rolls back.
+    fn pay_back(env: &Env, config: &Config, voucher: &mut Voucher) -> Result<(), VoucherError> {
         voucher.status = VoucherStatus::Refunded;
         write_voucher(env, voucher);
+
+        let escrow = env.current_contract_address();
+        let token_client = token::Client::new(env, &config.token);
+        let returned =
+            Self::transfer_from_escrow(&token_client, &escrow, &voucher.funder, voucher.amount)?;
+        if returned != voucher.amount {
+            return Err(VoucherError::TokenTransferFailed);
+        }
 
         VoucherRefunded {
             funder: voucher.funder.clone(),
@@ -534,5 +575,23 @@ impl VoucherEscrow {
             amount: voucher.amount,
         }
         .publish(env);
+        Ok(())
+    }
+
+    /// Sends `amount` out of escrow and returns how far the escrow's balance
+    /// actually fell, so the caller can check the token moved what it said it
+    /// moved. Returns `TokenTransferFailed` if the token refuses the call.
+    fn transfer_from_escrow(
+        token_client: &token::Client<'_>,
+        escrow: &Address,
+        to: &Address,
+        amount: i128,
+    ) -> Result<i128, VoucherError> {
+        let before = token_client.balance(escrow);
+        if token_client.try_transfer(escrow, to, &amount).is_err() {
+            return Err(VoucherError::TokenTransferFailed);
+        }
+        let after = token_client.balance(escrow);
+        before.checked_sub(after).ok_or(VoucherError::MathOverflow)
     }
 }

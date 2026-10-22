@@ -1,5 +1,7 @@
 #![cfg(test)]
 
+mod failure;
+
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
     token, Address, BytesN, Env, String,

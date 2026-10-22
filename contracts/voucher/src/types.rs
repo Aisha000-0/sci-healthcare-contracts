@@ -97,4 +97,9 @@ pub enum VoucherError {
     InvalidFee = 15,
     MathOverflow = 16,
     NoPendingAdmin = 17,
+    /// The token refused a transfer, or reported success without moving the
+    /// funds it was asked to move.
+    TokenTransferFailed = 18,
+    /// The receipt book rejected the care receipt for a settled voucher.
+    ReceiptMintFailed = 19,
 }
