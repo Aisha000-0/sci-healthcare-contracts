@@ -441,6 +441,12 @@ On testnet the faucet drips 50 USDC once a day: [`CCB25WG7DQ2CSNXPTOHZO2PDZ324FQ
 
 ---
 
+## Runnable example
+
+[`examples/lifecycle.ts`](../../examples/lifecycle.ts) runs the whole lifecycle against testnet — registers and activates a clinic, lists its service, funds a voucher, claims, attests, waits out the dispute window, settles, and prints the minted receipt — using `@stellar/stellar-sdk` and local keys. Contract ids come from `deployments/testnet.env`. See the README section "Run the lifecycle in TypeScript"; CI type-checks the script.
+
+---
+
 ## Storage lifetime (TTL)
 
 Soroban does not keep an entry forever. Every persistent entry carries a
