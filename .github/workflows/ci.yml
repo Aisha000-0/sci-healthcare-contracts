@@ -17,7 +17,7 @@ jobs:
     name: fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt
@@ -27,7 +27,7 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: clippy
@@ -38,7 +38,7 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all
@@ -47,7 +47,7 @@ jobs:
     name: coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: llvm-tools-preview
@@ -74,7 +74,7 @@ jobs:
             --ignore-filename-regex '/(tests?/.*|src/test\.rs)$' \
             --fail-under-lines 98 \
             --fail-under-regions 95
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: coverage-lcov
@@ -84,7 +84,7 @@ jobs:
     name: dependency audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # cargo deny needs cargo metadata, so the pinned toolchain has to be in
       # place first: the dependency graph requires rustc 1.91 or newer.
       - uses: dtolnay/rust-toolchain@1.96.0
@@ -101,7 +101,7 @@ jobs:
     name: build-wasm
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: wasm32v1-none
@@ -118,7 +118,7 @@ jobs:
         run: |
           ls -lh dist
           cat dist/SHA256SUMS
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: contracts-wasm
           path: |
@@ -129,16 +129,109 @@ jobs:
     name: deploy script
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Network-free: fake `stellar` and `build-wasm.sh` commands on PATH.
       - run: ./scripts/test-deploy.sh
+
+  reproducible-build:
+    name: reproducible build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: wasm32v1-none
+      # No cache for reproducible build - we need completely isolated builds
+      - name: Install wasm-opt
+        run: |
+          curl -sSL "https://github.com/WebAssembly/binaryen/releases/download/version_133/binaryen-version_133-x86_64-linux.tar.gz" \
+            | tar xz
+          echo "$PWD/binaryen-version_133/bin" >> "$GITHUB_PATH"
+      - name: Reproducible build
+        run: |
+          set -e
+          # Install wasm-opt
+          curl -sSL "https://github.com/WebAssembly/binaryen/releases/download/version_133/binaryen-version_133-x86_64-linux.tar.gz" \
+            | tar xz
+          echo "$PWD/binaryen-version_133/bin" >> "$GITHUB_PATH"
+
+          # First build
+          mkdir -p /tmp/build1
+          cp -r . /tmp/build1/src
+          mkdir -p /tmp/cargo-home-1
+          cd /tmp/build1/src && CARGO_HOME=/tmp/cargo-home-1 ./scripts/build-wasm.sh
+          echo "First build output:"
+          ls -la /tmp/build1/src/dist/
+          mkdir -p dist1
+          cp -v /tmp/build1/src/dist/* dist1/
+          echo "dist1 contents:"
+          ls -la dist1/
+
+          # Second build
+          mkdir -p /tmp/build2
+          cp -r . /tmp/build2/src
+          mkdir -p /tmp/cargo-home-2
+          cd /tmp/build2/src && CARGO_HOME=/tmp/cargo-home-2 ./scripts/build-wasm.sh
+          echo "Second build output:"
+          ls -la /tmp/build2/src/dist/
+          mkdir -p dist2
+          cp -v /tmp/build2/src/dist/* dist2/
+          echo "dist2 contents:"
+          ls -la dist2/
+
+          # Compare checksums
+          echo "dist1 contents:"
+          ls -la dist1/
+          echo "dist2 contents:"
+          ls -la dist2/
+          if ! diff dist1/SHA256SUMS dist2/SHA256SUMS; then
+            echo "::error::Builds are not reproducible - checksums differ"
+            echo "First build:"
+            cat dist1/SHA256SUMS
+            echo "Second build:"
+            cat dist2/SHA256SUMS
+            exit 1
+          fi
+          echo "Builds are reproducible - checksums match"
+
+  doc:
+    name: doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build docs
+        run: cargo doc --no-deps --workspace --document-private-items
+      - name: Deploy docs
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./target/doc
+
+  example-typecheck:
+    name: example-typecheck
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: examples/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
 
   bot:
     name: auto-merge bot tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
       - run: node --test .github/scripts/automerge.test.cjs .github/scripts/security-scan.test.cjs

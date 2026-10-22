@@ -282,6 +282,8 @@
     ],
     [],
     [],
+    [],
+    [],
     []
   ],
   "ledger": {
@@ -815,6 +817,12 @@
                   },
                   {
                     "key": {
+                      "symbol": "attester"
+                    },
+                    "val": "void"
+                  },
+                  {
+                    "key": {
                       "symbol": "beneficiary_ref"
                     },
                     "val": {
@@ -936,6 +944,14 @@
                           },
                           {
                             "key": {
+                              "symbol": "attester_share_bps"
+                            },
+                            "val": {
+                              "u32": 50
+                            }
+                          },
+                          {
+                            "key": {
                               "symbol": "dispute_window"
                             },
                             "val": {
@@ -995,6 +1011,18 @@
                       },
                       "val": {
                         "u64": "2"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "OpenEscrow"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "0"
                       }
                     }
                   ]

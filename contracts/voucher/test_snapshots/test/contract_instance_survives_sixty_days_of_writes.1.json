@@ -544,6 +544,7 @@
       ]
     ],
     [],
+    [],
     []
   ],
   "ledger": {
@@ -1137,6 +1138,12 @@
                   },
                   {
                     "key": {
+                      "symbol": "attester"
+                    },
+                    "val": "void"
+                  },
+                  {
+                    "key": {
                       "symbol": "beneficiary_ref"
                     },
                     "val": {
@@ -1258,6 +1265,12 @@
                     "val": {
                       "u64": "0"
                     }
+                  },
+                  {
+                    "key": {
+                      "symbol": "attester"
+                    },
+                    "val": "void"
                   },
                   {
                     "key": {
@@ -1385,6 +1398,12 @@
                   },
                   {
                     "key": {
+                      "symbol": "attester"
+                    },
+                    "val": "void"
+                  },
+                  {
+                    "key": {
                       "symbol": "beneficiary_ref"
                     },
                     "val": {
@@ -1506,6 +1525,12 @@
                     "val": {
                       "u64": "0"
                     }
+                  },
+                  {
+                    "key": {
+                      "symbol": "attester"
+                    },
+                    "val": "void"
                   },
                   {
                     "key": {
@@ -1633,6 +1658,12 @@
                   },
                   {
                     "key": {
+                      "symbol": "attester"
+                    },
+                    "val": "void"
+                  },
+                  {
+                    "key": {
                       "symbol": "beneficiary_ref"
                     },
                     "val": {
@@ -1754,6 +1785,12 @@
                     "val": {
                       "u64": "0"
                     }
+                  },
+                  {
+                    "key": {
+                      "symbol": "attester"
+                    },
+                    "val": "void"
                   },
                   {
                     "key": {
@@ -1881,6 +1918,12 @@
                   },
                   {
                     "key": {
+                      "symbol": "attester"
+                    },
+                    "val": "void"
+                  },
+                  {
+                    "key": {
                       "symbol": "beneficiary_ref"
                     },
                     "val": {
@@ -2002,6 +2045,14 @@
                           },
                           {
                             "key": {
+                              "symbol": "attester_share_bps"
+                            },
+                            "val": {
+                              "u32": 50
+                            }
+                          },
+                          {
+                            "key": {
                               "symbol": "dispute_window"
                             },
                             "val": {
@@ -2061,6 +2112,18 @@
                       },
                       "val": {
                         "u64": "8"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "OpenEscrow"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "210000000"
                       }
                     }
                   ]

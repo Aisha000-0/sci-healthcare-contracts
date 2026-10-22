@@ -812,6 +812,12 @@
                   },
                   {
                     "key": {
+                      "symbol": "attester"
+                    },
+                    "val": "void"
+                  },
+                  {
+                    "key": {
                       "symbol": "beneficiary_ref"
                     },
                     "val": {
@@ -933,6 +939,14 @@
                           },
                           {
                             "key": {
+                              "symbol": "attester_share_bps"
+                            },
+                            "val": {
+                              "u32": 50
+                            }
+                          },
+                          {
+                            "key": {
                               "symbol": "dispute_window"
                             },
                             "val": {
@@ -992,6 +1006,18 @@
                       },
                       "val": {
                         "u64": "2"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "OpenEscrow"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "0"
                       }
                     }
                   ]
@@ -1294,10 +1320,34 @@
               "map": [
                 {
                   "key": {
+                    "symbol": "fee"
+                  },
+                  "val": {
+                    "i128": "0"
+                  }
+                },
+                {
+                  "key": {
                     "symbol": "refunded_funder"
                   },
                   "val": {
                     "bool": true
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "to_funder"
+                  },
+                  "val": {
+                    "i128": "30000000"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "to_provider"
+                  },
+                  "val": {
+                    "i128": "0"
                   }
                 },
                 {

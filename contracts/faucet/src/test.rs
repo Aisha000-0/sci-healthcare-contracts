@@ -25,6 +25,10 @@ struct Fixture {
 }
 
 fn setup() -> Fixture {
+    setup_with_caps(DAILY_CAP, 0)
+}
+
+fn setup_with_caps(daily_cap: i128, lifetime_cap: i128) -> Fixture {
     let env = Env::default();
     env.mock_all_auths();
     env.ledger().with_mut(|li| li.timestamp = START_TIME);
@@ -36,7 +40,14 @@ fn setup() -> Fixture {
 
     let faucet_addr = env.register(Faucet, ());
     let faucet = FaucetClient::new(&env, &faucet_addr);
-    faucet.initialize(&admin, &token_addr, &DRIP, &COOLDOWN, &DAILY_CAP);
+    faucet.initialize(
+        &admin,
+        &token_addr,
+        &DRIP,
+        &COOLDOWN,
+        &daily_cap,
+        &lifetime_cap,
+    );
 
     // The issuer hands token administration to the faucet, as on testnet.
     let sac = token::StellarAssetClient::new(&env, &token_addr);
@@ -240,7 +251,7 @@ fn initialize_is_single_shot() {
     let a = Address::generate(&f.env);
     let err = f
         .faucet
-        .try_initialize(&a, &a, &DRIP, &COOLDOWN, &DAILY_CAP)
+        .try_initialize(&a, &a, &DRIP, &COOLDOWN, &DAILY_CAP, &0i128)
         .err()
         .unwrap()
         .unwrap();
@@ -259,7 +270,71 @@ fn zero_daily_cap_is_rejected() {
     let faucet = FaucetClient::new(&env, &faucet_addr);
 
     let err = faucet
-        .try_initialize(&admin, &token_addr, &DRIP, &COOLDOWN, &0i128)
+        .try_initialize(&admin, &token_addr, &DRIP, &COOLDOWN, &0i128, &0i128)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, FaucetError::InvalidAmount);
+}
+
+#[test]
+fn lifetime_cap_is_enforced_across_days() {
+    // Two drips per address, ever, with room in the shared daily cap.
+    let f = setup_with_caps(10 * DRIP, 2 * DRIP);
+    let user = Address::generate(&f.env);
+
+    f.faucet.drip(&user);
+    advance(&f.env, COOLDOWN);
+    f.faucet.drip(&user);
+
+    // Another day and another cooldown do not reset a lifetime cap.
+    advance(&f.env, 24 * 60 * 60 + 1);
+    let err = f.faucet.try_drip(&user).err().unwrap().unwrap();
+    assert_eq!(err, FaucetError::LifetimeCapReached);
+    assert_eq!(f.token.balance(&user), 2 * DRIP);
+}
+
+#[test]
+fn lifetime_cap_is_per_address() {
+    let f = setup_with_caps(10 * DRIP, DRIP);
+    let capped = Address::generate(&f.env);
+    let other = Address::generate(&f.env);
+
+    f.faucet.drip(&capped);
+    advance(&f.env, COOLDOWN);
+    let err = f.faucet.try_drip(&capped).err().unwrap().unwrap();
+    assert_eq!(err, FaucetError::LifetimeCapReached);
+
+    // A different address still has its own allowance.
+    assert_eq!(f.faucet.drip(&other), DRIP);
+    assert_eq!(f.token.balance(&other), DRIP);
+}
+
+#[test]
+fn zero_lifetime_cap_means_unlimited() {
+    let f = setup_with_caps(10 * DRIP, 0);
+    let user = Address::generate(&f.env);
+
+    for _ in 0..5 {
+        f.faucet.drip(&user);
+        advance(&f.env, COOLDOWN);
+    }
+    assert_eq!(f.token.balance(&user), 5 * DRIP);
+}
+
+#[test]
+fn negative_lifetime_cap_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let issuer = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(issuer);
+    let token_addr = asset.address();
+    let faucet_addr = env.register(Faucet, ());
+    let faucet = FaucetClient::new(&env, &faucet_addr);
+
+    let err = faucet
+        .try_initialize(&admin, &token_addr, &DRIP, &COOLDOWN, &DAILY_CAP, &-1i128)
         .err()
         .unwrap()
         .unwrap();
@@ -334,4 +409,23 @@ fn set_drip_emits_drip_changed_event() {
     assert_eq!(last_event_name(&f.env, contract), "drip_changed");
     assert_eq!(last_event_i128(&f.env, contract, "amount"), 10);
     assert_eq!(last_event_u64(&f.env, contract, "cooldown"), 0);
+}
+
+#[test]
+fn not_initialized_errors() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = START_TIME);
+    let a = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(issuer);
+    let _token_addr = asset.address();
+    let faucet_addr = env.register(Faucet, ());
+    let faucet = FaucetClient::new(&env, &faucet_addr);
+
+    // Any call before initialize should return NotInitialized.
+    let err = faucet.try_get_config().err().unwrap().unwrap();
+    assert_eq!(err, FaucetError::NotInitialized);
+    let err = faucet.try_drip(&a).err().unwrap().unwrap();
+    assert_eq!(err, FaucetError::NotInitialized);
 }

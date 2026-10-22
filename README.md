@@ -12,7 +12,7 @@
   <img src="https://img.shields.io/badge/soroban--sdk-27.0.6-blue" alt="soroban-sdk 27.0.6" />
   <img src="https://img.shields.io/badge/rust-1.96-orange" alt="rust 1.96" />
   <img src="https://img.shields.io/badge/license-Apache--2.0-green" alt="Apache 2.0" />
-  <img src="https://img.shields.io/badge/tests-100%20passing-brightgreen" alt="100 tests" />
+  <img src="https://img.shields.io/badge/tests-195%20passing-brightgreen" alt="195 tests" />
 </p>
 
 # SCI Healthcare — Contracts | [Documentation](https://godgift-care.github.io/sci-healthcare-contracts/)
@@ -112,11 +112,13 @@ Three contracts, one responsibility each.
                  claim              attest             settle
   Funded ──────────────> Claimed ───────────> Attested ────────> Settled
     │                       │                     │
-    │ refund (past expiry)  │ dispute             │ dispute
-    ▼                       ▼                     ▼
- Refunded  <───────────  Disputed  ──── resolve ──┴──> Settled
-    ▲                       │
-    └───────────────────────┘ refund (claimed, never attested, 7 days past expiry)
+    │ refund                │ dispute             │ dispute
+    │ (expired or           ▼                     ▼
+    │  clinic inactive)  Disputed <───────────────┘
+    ▼                       │
+ Refunded  <──── resolve ────┴──── resolve ────> Settled
+    ▲
+    └── refund (claimed, never attested, 7 days past expiry)
 ```
 
 `settle` and `refund` are **permissionless** — a clinic never depends on the funder or an operator to get paid.
@@ -151,7 +153,7 @@ cargo install --locked wasm-opt   # or download the binaryen release above
 ```bash
 git clone https://github.com/Godgift-care/sci-healthcare-contracts
 cd sci-healthcare-contracts
-cargo test                                    # 100 tests
+cargo test                                    # 195 tests
 cargo build --target wasm32v1-none --release  # three .wasm artifacts
 ./scripts/build-wasm.sh                       # the release build: optimised wasm + SHA256SUMS
 ```
@@ -180,7 +182,7 @@ stellar keys generate --network testnet --fund sci-issuer
 | --- | --- |
 | `cargo fmt --all -- --check` | formatting drift |
 | `cargo clippy --all-targets --all-features -- -D warnings` | lint warnings |
-| `cargo test --all` | broken behaviour (100 tests) |
+| `cargo test --all` | broken behaviour (195 tests) |
 | `cargo llvm-cov` | contract lines the tests never reach |
 | `cargo deny check` | dependencies with a known advisory or an incompatible licence |
 | `./scripts/build-wasm.sh` | a contract that no longer compiles to wasm |
@@ -188,7 +190,7 @@ stellar keys generate --network testnet --fund sci-issuer
 
 **Coverage.** The `coverage` job prints the coverage table in the job output
 and fails when the contract sources drop below the threshold. Today the
-contracts are at **98.14% of lines** and **95.99% of regions**; the thresholds
+contracts are at **98.35% of lines** and **97.29% of regions**; the thresholds
 in CI sit just under those numbers, at 98% and 95%. Test files are excluded:
 the number that matters is how much of the contract code the tests reach.
 Raise the threshold in the same pull request that adds the tests.
@@ -202,6 +204,25 @@ today, and any future one has to carry a reason.
 `wasm-opt -Oz` and attaches them to the GitHub release together with a
 `SHA256SUMS` file and notes that explain how to compare the hash with a
 deployed contract.
+
+### Run the lifecycle in TypeScript
+
+[`examples/lifecycle.ts`](examples/lifecycle.ts) is the same journey as `seed.sh` — fund, claim, attest, settle — written with [`@stellar/stellar-sdk`](https://github.com/stellar/js-stellar-sdk) and local keys instead of the CLI, and it finishes the story: it waits out the dispute window, calls `settle`, and prints the receipt the contract minted.
+
+```bash
+# from the repository root — a short window lets one run reach settle
+DISPUTE_WINDOW=60 ./scripts/deploy.sh testnet
+cd examples && npm install
+export ADMIN_SECRET=…                            # the seed of your deployment's admin
+npm run lifecycle                                # fund → claim → attest → settle
+npm run lifecycle -- settle <voucher-id>         # finish a voucher later, if the window is long
+```
+
+- Contract ids come from `deployments/testnet.env` (written by `deploy.sh`); `REGISTRY_CONTRACT_ID` and friends override it.
+- `CLINIC_SECRET`, `ATTESTER_SECRET` and `FUNDER_SECRET` are optional — a missing one is generated, printed and friendbotted, so only `ADMIN_SECRET` is required. `ISSUER_SECRET` is needed only when the deployment has no faucet.
+- Activation and attestation are admin-gated, so a full run needs a deployment you control; the shared ids in the table above belong to the maintainer's deployment.
+- Node 18+ is required; the script polyfills the Web Crypto global that older Node versions hide from `tsx`.
+- CI type-checks the example, so it stays working.
 
 ## Contract reference
 
@@ -230,17 +251,19 @@ deployed contract.
 
 | Function | Auth | Purpose |
 | --- | --- | --- |
-| `initialize(admin, registry, receipt_book, token, dispute_window, fee_bps, fee_account)` | once | Fixes protocol config; fee capped at 10% |
+| `initialize(admin, registry, receipt_book, token, dispute_window, fee_bps, attester_share_bps, fee_account)` | once | Fixes protocol config; fee capped at 10%, attester share at the fee |
 | `create_voucher(funder, beneficiary_ref, provider, service_code, amount, expires_at)` | funder | Escrows funds against one service at one active provider |
+| `reduce_amount(funder, voucher_id, new_amount)` | funder | Returns an overpayment to the funder while the voucher is still `Funded` |
 | `claim(provider, voucher_id)` | provider | Marks the patient as presented |
 | `attest(attester, voucher_id)` | attester | Confirms delivery; opens the dispute window |
 | `dispute(funder, voucher_id, reason_code)` | funder | Contests before the window closes |
 | `settle(voucher_id)` | none | Releases escrow once the window closes |
-| `refund(voucher_id)` | none | Returns escrow after an unclaimed voucher expires, or 7 days after expiry if claimed but never attested |
+| `refund(voucher_id)` | none | Returns escrow once an unclaimed voucher expires or its clinic is no longer active, or 7 days after expiry if claimed but never attested |
 | `set_attestation_cap(admin, cap)` | admin | Caps attestations per attester per UTC day (default 100) |
 | `refundable_at(voucher_id)` | view | When `refund` will succeed |
 | `propose_admin` / `accept_admin` | admin / nominee | Two-step admin handover |
 | `resolve_dispute(admin, voucher_id, refund_funder)` | admin | Routes escrow to one of the two parties |
+| `resolve_split(admin, voucher_id, to_provider)` | admin | Splits escrow between the clinic, the fee account and the funder |
 | `quote(amount)` | view | `(fee, net)` so a clinic sees exactly what lands |
 
 ### `receipt`

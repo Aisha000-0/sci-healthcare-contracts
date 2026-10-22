@@ -164,6 +164,18 @@ pub struct Voucher {
     pub claimed_at: u64,
     pub attested_at: u64,
     pub dispute_deadline: u64,
+    pub attester: Option<Address>,     // set by `attest`, paid at settlement
+}
+
+pub struct Config {
+    pub admin: Address,
+    pub registry: Address,
+    pub receipt_book: Address,
+    pub token: Address,
+    pub dispute_window: u64,
+    pub fee_bps: u32,
+    pub attester_share_bps: u32,       // part of fee_bps, never more
+    pub fee_account: Address,
 }
 
 pub struct Exposure {            // a clinic's open vouchers
@@ -176,14 +188,16 @@ pub struct Exposure {            // a clinic's open vouchers
 
 | Function | Parameters | Returns | Auth |
 | --- | --- | --- | --- |
-| `initialize` | `admin, registry, receipt_book, token, dispute_window, fee_bps, fee_account` | `()` | once |
+| `initialize` | `admin, registry, receipt_book, token, dispute_window, fee_bps, attester_share_bps, fee_account` | `()` | once |
 | `create_voucher` | `funder, beneficiary_ref, provider, service_code, amount, expires_at` | `u64` | `funder` |
+| `reduce_amount` | `funder, voucher_id, new_amount` | `()` | `funder` |
 | `claim` | `provider, voucher_id` | `()` | `provider` |
 | `attest` | `attester, voucher_id` | `()` | `attester` |
 | `dispute` | `funder, voucher_id, reason_code` | `()` | `funder` |
 | `settle` | `voucher_id` | `()` | **none** |
 | `refund` | `voucher_id` | `()` | **none** |
 | `resolve_dispute` | `admin, voucher_id, refund_funder: bool` | `()` | `admin` |
+| `resolve_split` | `admin, voucher_id, to_provider: i128` | `()` | `admin` |
 | `set_attestation_cap` | `admin, cap: u32` | `()` | `admin` |
 | `set_max_escrow_per_provider` | `admin, max: i128` | `()` | `admin` |
 | `propose_admin` | `admin, new_admin` | `()` | `admin` |
@@ -198,9 +212,10 @@ pub struct Exposure {            // a clinic's open vouchers
 | `get_config` | — | `Config` | view |
 | `next_voucher_id` | — | `u64` | view |
 | `quote` | `amount` | `(i128, i128)` | view |
+| `escrow_summary` | — | `(i128, i128)` | view |
 | `version` | — | `String` | view |
 
-`fee_bps` is capped at 1000 (10%) at initialisation.
+`fee_bps` is capped at 1000 (10%) at initialisation. `attester_share_bps` is the part of the voucher amount paid to the attester who confirmed delivery, and must be **no greater than `fee_bps`** (`InvalidAttesterShare`, #21). It is carved out of the fee, so the clinic's net is unchanged and the payouts sum exactly to the voucher amount. Zero keeps the pre-attester-share behaviour: the fee account receives the whole fee.
 
 `settle` and `refund` take no authorisation deliberately: a clinic that has delivered attested care must never depend on the funder or an operator to be paid.
 
@@ -212,12 +227,14 @@ Every public function, with the exact signer it demands. `AUTH_MATRIX` in `contr
 | --- | --- |
 | `initialize` | none (one-shot) |
 | `create_voucher` | `funder` |
+| `reduce_amount` | `funder` |
 | `claim` | `provider` |
 | `attest` | `attester` |
 | `dispute` | `funder` |
 | `settle` | none (permissionless) |
 | `refund` | none (permissionless) |
 | `resolve_dispute` | `admin` |
+| `resolve_split` | `admin` |
 | `set_attestation_cap` | `admin` |
 | `set_max_escrow_per_provider` | `admin` |
 | `propose_admin` | `admin` |
@@ -232,6 +249,7 @@ Every public function, with the exact signer it demands. `AUTH_MATRIX` in `contr
 | `get_config` | none (view) |
 | `next_voucher_id` | none (view) |
 | `quote` | none (view) |
+| `escrow_summary` | none (view) |
 | `version` | none (view) |
 
 `settle` and `refund` are the two permissionless rows, and that is the point:
@@ -243,23 +261,27 @@ rejects the voucher's own provider even if it holds that role.
 
 **`create_voucher`** — amount > 0; expiry in the future; provider is `Active`; the service exists and is active; amount ≥ listed price; the service is not paused (`ServiceUnavailable`); the clinic is below the capacity it declared in the registry (`ProviderAtCapacity`); the clinic's escrow plus this amount stays within the per-clinic cap (`EscrowCapReached`). Transfers the token *before* writing the voucher, so a failed transfer reverts everything.
 
-**`set_max_escrow_per_provider`** — caller is admin; `max` ≥ 0 (`InvalidEscrowCap`). `0`, the default, is unlimited. The cap limits what one clinic can hold in escrow across all its open vouchers, so a verified clinic that turns out to be fraudulent is exposed to at most this much. `get_exposure(provider)` returns the clinic's open voucher count and escrowed value; both fall when a voucher settles or refunds, including through `resolve_dispute`. Lowering the cap only affects new vouchers.
+**`set_max_escrow_per_provider`** — caller is admin; `max` ≥ 0 (`InvalidEscrowCap`). `0`, the default, is unlimited. The cap limits what one clinic can hold in escrow across all its open vouchers, so a verified clinic that turns out to be fraudulent is exposed to at most this much. `get_exposure(provider)` returns the clinic's open voucher count and escrowed value; both fall when a voucher settles or refunds, including through `resolve_dispute` and `resolve_split`, and the value falls by the refunded difference when `reduce_amount` lowers a voucher. Lowering the cap only affects new vouchers.
+
+**`reduce_amount`** — caller is the funder of this voucher (`NotAuthorized`); status is `Funded` (`InvalidStatus`); `new_amount` > 0 (`InvalidAmount`) and strictly below the escrowed amount (`AmountNotReduced`); the service is still listed (`ServiceNotOffered`); and `new_amount` ≥ the price the registry lists **at call time** (`AmountBelowPrice`). The difference goes straight back to the funder and the escrow keeps the rest; no fee is taken on money that never became care, and the `open_escrow` total follows the difference down. The price at call time is the floor, not the price at funding time: a clinic that has raised its price cannot have a funded voucher reduced below that price, and a clinic that has lowered it frees the funder to reduce further. A voucher whose service has been delisted cannot be reduced at all — there is no floor to reduce towards — and is refunded at expiry instead. Once the clinic has claimed the voucher the amount is what the clinic expects to be paid, so the reduction is closed.
 
 **`claim`** — caller is the named provider; provider is still `Active` in the registry; status is `Funded`; not expired.
 
-**`attest`** — caller is a registry attester; caller is **not** the provider; status is `Claimed`; the attester has attestations left today. Sets `dispute_deadline = now + dispute_window`.
+**`attest`** — caller is a registry attester; caller is **not** the provider; status is `Claimed`; the attester has attestations left today. Stores the attester on the voucher and sets `dispute_deadline = now + dispute_window`.
 
 **`set_attestation_cap`** — caller is admin; `cap` ≥ 1 (`InvalidAttestationCap`). Each attester may attest at most `cap` vouchers per UTC day (`timestamp / 86400`); the next is rejected with `AttestationCapReached` until midnight UTC, when the counter resets. The default is `DEFAULT_MAX_ATTESTATIONS_PER_DAY` (100). Counters live in temporary storage keyed by `(attester, day)`. The cap bounds what a stolen attester key can confirm before the admin removes it from the registry; `attestations_left(attester)` and the `remaining_today` field of `voucher_attested` show how close an attester is.
 
 **`dispute`** — caller is the funder; status is `Claimed`, or `Attested` and before the deadline.
 
-**`settle`** — status is `Attested`; now ≥ `dispute_deadline`. Pays provider, takes fee, mints a receipt.
+**`settle`** — status is `Attested`; now ≥ `dispute_deadline`; the contract still holds the voucher's amount (`EscrowShortfall` if the token issuer clawed escrow back); the token accepts the transfers (`TokenTransferFailed` if the issuer froze the escrow, the clinic or the attester). Pays the clinic `amount - fee`, the attester its share (`amount * attester_share_bps / 10_000`), and the fee account the remaining fee, then mints a receipt. The three payouts sum to `amount` exactly. If no attester is recorded — a dispute resolved for the provider without an attestation — the fee account receives the whole fee.
 
-**`refund`** — status is `Funded` and now ≥ `expires_at`, or status is `Claimed` and now ≥ `expires_at + CLAIM_GRACE_SECS` (7 days). Returns the full amount, no fee. `refundable_at` returns the exact time.
+**`refund`** — status is `Funded` and either now ≥ `expires_at` or the provider is no longer active in the registry (so a suspended clinic's voucher is refundable immediately, before expiry), or status is `Claimed` and now ≥ `expires_at + CLAIM_GRACE_SECS` (7 days). Suspension does not shorten the claim grace: care may already have been given. Returns the full amount, no fee. `refundable_at` returns the exact time, which is the current ledger time when a funded voucher's provider is inactive. It has the same `EscrowShortfall` and `TokenTransferFailed` checks as `settle`, and so do `resolve_dispute`, `resolve_split` and the refund in `reduce_amount`, which pay through the same paths. Either error reverts the whole call, so the voucher keeps its status; see [the settlement token's issuer](../protocol/trust.md#the-settlement-tokens-issuer).
 
 **`propose_admin` / `accept_admin`** — two-step handover, identical in all three contracts. Proposing again replaces the nominee; nothing changes until the nominee signs `accept_admin`. On mainnet, hand admin to a 2-of-3 Stellar multisig account rather than a single key; see [Using a multisig admin](multisig-admin.md).
 
 **`resolve_dispute`** — caller is admin; status is `Disputed`. Routes to funder or provider; no third destination exists.
+
+**`escrow_summary`** — a read-only solvency check returning `(open_escrow, token_balance)`. `open_escrow` is a running instance-storage total of every funded voucher that has not yet settled or refunded; it is increased by `create_voucher` and decreased by `settle`, `refund` and both outcomes of `resolve_dispute`, and by `reduce_amount` for the part that goes back to the funder. `token_balance` is the contract's real balance of the settlement token. The two are equal when the accounting is correct, so anyone can check the contract without scanning every voucher. No authorisation is required.
 
 ### Errors
 
@@ -277,9 +299,13 @@ rejects the voucher's own provider even if it holds that role.
 |  |  | 18 | `ServiceUnavailable` |
 |  |  | 19 | `AttestationCapReached` |
 |  |  | 20 | `InvalidAttestationCap` |
-|  |  | 21 | `ProviderAtCapacity` |
-|  |  | 22 | `EscrowCapReached` |
-|  |  | 23 | `InvalidEscrowCap` |
+|  |  | 21 | `InvalidAttesterShare` |
+|  |  | 22 | `AmountNotReduced` |
+|  |  | 23 | `EscrowShortfall` |
+|  |  | 24 | `TokenTransferFailed` |
+|  |  | 25 | `ProviderAtCapacity` |
+|  |  | 26 | `EscrowCapReached` |
+|  |  | 27 | `InvalidEscrowCap` |
 
 ### Events
 
@@ -289,9 +315,10 @@ rejects the voucher's own provider even if it holds that role.
 | `voucher_claimed` | `provider` | `voucher_id`, `claimed_at`, `service_code`, `amount` |
 | `voucher_attested` | `attester` | `voucher_id`, `attested_at`, `dispute_deadline`, `service_code`, `amount`, `remaining_today` |
 | `voucher_disputed` | `funder` | `voucher_id`, `reason_code`, `service_code`, `amount` |
-| `voucher_settled` | `provider` | `voucher_id`, `net`, `fee`, `service_code`, `amount` |
+| `voucher_settled` | `provider` | `voucher_id`, `net`, `fee`, `service_code`, `amount`, `attester_share` |
 | `voucher_refunded` | `funder` | `voucher_id`, `amount`, `service_code` |
-| `dispute_resolved` | `admin` | `voucher_id`, `refunded_funder` |
+| `voucher_amount_reduced` | `funder` | `voucher_id`, `service_code`, `previous_amount`, `amount`, `refunded` |
+| `dispute_resolved` | `admin` | `voucher_id`, `refunded_funder`, `to_provider`, `fee`, `to_funder` |
 | `attestation_cap_changed` | `admin` | `cap` |
 | `escrow_cap_changed` | `admin` | `max` |
 
@@ -300,6 +327,8 @@ rejects the voucher's own provider even if it holds that role.
 > Every event in this table has a snapshot test that reads the decoded XDR and asserts the exact topic list and data map — `*_event_snapshot` in each contract's `src/test.rs`. Changing a field name, moving a field between topic and data, or adding a field fails that test with a message naming `TOPIC_FIELDS` in `sci-healthcare-backend/src/stellar/events.ts`.
 >
 > Every lifecycle event now carries `service_code` and `amount`, appended **after** the fields each event already had, so one event says what was paid for without a storage lookup. The data map is keyed by field name (an XDR `ScMap`), and existing fields keep their positions: decoders that read by name — including `sci-healthcare-backend` — pick the new fields up without a breaking change. `voucher_refunded` already carried `amount`; it gains `service_code` only.
+>
+> `voucher_amount_reduced` is new, so it needs one line in the indexer: `voucher_amount_reduced: ['funder']` in `TOPIC_FIELDS` in `sci-healthcare-backend/src/stellar/events.ts`. Without it the event still decodes — the decoder falls back to no topic names — but the `funder` topic reads as `undefined`. Its data fields are read by name and need no decoder change.
 
 ---
 
@@ -396,7 +425,7 @@ Lets anyone trying the demo get test USDC without a server holding the issuer ke
 
 | Function | Parameters | Returns | Auth |
 | --- | --- | --- | --- |
-| `initialize` | `admin, token, amount, cooldown, daily_cap` | `()` | once |
+| `initialize` | `admin, token, amount, cooldown, daily_cap, lifetime_cap` | `()` | once |
 | `drip` | `to` | `i128` | `to` |
 | `set_drip` | `admin, amount, cooldown` | `()` | `admin` |
 | `set_paused` | `admin, paused` | `()` | `admin` |
@@ -409,6 +438,8 @@ Lets anyone trying the demo get test USDC without a server holding the issuer ke
 
 `initialize` sets a `daily_cap` — the total base units the faucet may mint per UTC day across every address combined. The counter resets at each day boundary, and drips beyond it are rejected with `DailyCapReached`. The admin can pause the faucet with `set_paused(admin, true)` without giving up the token admin role; while paused, every `drip` is rejected with `Paused`.
 
+`initialize` also sets a per-address `lifetime_cap`: the total base units one address may ever receive. It is tracked in a persistent counter per address and never resets, so an address at its cap is rejected with `LifetimeCapReached` even on a new UTC day. A `lifetime_cap` of `0` means unlimited; a negative value is rejected with `InvalidAmount`. The counter is TTL-extended on every read and write.
+
 On testnet the faucet drips 50 USDC once a day: [`CCB25WG7DQ2CSNXPTOHZO2PDZ324FQPZLH3LSNCCLWYM3FEH52GEXC47`](https://stellar.expert/explorer/testnet/contract/CCB25WG7DQ2CSNXPTOHZO2PDZ324FQPZLH3LSNCCLWYM3FEH52GEXC47).
 
 | # | Error |
@@ -420,6 +451,7 @@ On testnet the faucet drips 50 USDC once a day: [`CCB25WG7DQ2CSNXPTOHZO2PDZ324FQ
 | 5 | `CoolingDown` |
 | 6 | `DailyCapReached` |
 | 7 | `Paused` |
+| 8 | `LifetimeCapReached` |
 
 ### Events
 
@@ -429,6 +461,12 @@ On testnet the faucet drips 50 USDC once a day: [`CCB25WG7DQ2CSNXPTOHZO2PDZ324FQ
 | `drip_changed` | — | `amount`, `cooldown` |
 
 `drip_changed` is published by `set_drip` so configuration changes are auditable. Its data map is keyed by field name; topics are unchanged.
+
+---
+
+## Runnable example
+
+[`examples/lifecycle.ts`](../../examples/lifecycle.ts) runs the whole lifecycle against testnet — registers and activates a clinic, lists its service, funds a voucher, claims, attests, waits out the dispute window, settles, and prints the minted receipt — using `@stellar/stellar-sdk` and local keys. Contract ids come from `deployments/testnet.env`. See the README section "Run the lifecycle in TypeScript"; CI type-checks the script.
 
 ---
 
@@ -450,6 +488,7 @@ stays in the live ledger. These are the numbers, all in ledgers:
 | `Receipt(id)`, `Count(beneficiary_ref)` | persistent | every read and write | 30 days | 90 days |
 | `ProviderCount(provider)`, `ProviderReceipt(provider, index)` | persistent | every mint and `receipts_of_provider` read | 30 days | 90 days |
 | Faucet `LastDrip(address)` | temporary | every drip | 1 day | 7 days |
+| Faucet `LifetimeDripped(address)` | persistent | every drip and lifetime-cap read | 30 days | 90 days |
 
 "Extended when" is a threshold, not a refresh on every call: the TTL is only
 pushed back out once the remaining life drops below the threshold. A read on
@@ -546,6 +585,16 @@ would discover. `scripts/test-deploy.sh` exercises the refusal, `--force` and
 `deploy.sh` is a **testnet** tool: it deploys a test USDC asset from the
 `$ISSUER` identity. It is not the mainnet deployment procedure. Do not point it
 at mainnet; use the reviewed process in the [mainnet launch checklist](mainnet-checklist.md).
+
+### Operating a deployment
+
+Three scripts cover what happens after `deploy.sh`. Each reads `deployments/<network>.env`, and each was run against a local `stellar/quickstart` node.
+
+**Rotating the admin** — `./scripts/rotate-admin.sh <network> <new-admin-identity>` hands registry, voucher and receipt to a new key in the two steps each contract requires: the current admin (`ADMIN`, default `sci-admin`) proposes on all three, then the new key accepts on all three. A preflight reads every admin first and refuses to start if any is neither the current nor the new key. The script stops at the first failed call; nothing changes until `accept_admin`, so a stop leaves the old admin in charge and a re-run picks up where it stopped. It reads each admin back, prints a summary and records the new `ADMIN_ADDRESS` in the env file. `--dry-run` prints the commands without sending anything. The faucet keeps its own admin. For a multisig admin, see [Using a multisig admin](multisig-admin.md).
+
+**Checking the wiring** — `./scripts/verify-deployment.sh [network] [--env-file FILE]` reads each contract's configuration through read-only simulations and checks it against the env file: the voucher's `registry`, `receipt_book`, `token`, `admin`, `fee_bps`, `fee_account` and `dispute_window`, the receipt book's minter (the voucher) and admin, the registry's admin, and the faucet's token when there is one. Every check prints `PASS` or `FAIL` and any failure exits non-zero. Expected fee, window and fee account default to what `deploy.sh` uses (`FEE_BPS`, `DISPUTE_WINDOW`, `FEE_ACCOUNT` override them). This is the wiring check; `verify-deployments.sh` is the bytecode check, and a deployment should pass both.
+
+**Seeding at volume** — `./scripts/seed-large.sh <network> <clinics> <vouchers>` registers and activates clinics across ten countries with three services each, then funds vouchers cycling through every state: Funded, Claimed, Attested, Settled, Disputed and Refunded. Clinic and funder identities (`sci-large-clinic-N`, `sci-large-funder-N`) are created once and reused, and an already-registered clinic is skipped. Settled and Refunded need the dispute window and an expiry to pass; the script waits up to `MAX_WAIT` (300 s), so on a local node deploy with `DISPUTE_WINDOW=30` to get every state. It reads every voucher back and prints the count per state. It refuses to run against mainnet.
 
 ### Integrating from another app
 
