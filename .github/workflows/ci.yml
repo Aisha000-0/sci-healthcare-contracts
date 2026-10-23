@@ -17,7 +17,7 @@ jobs:
     name: fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt
@@ -27,7 +27,7 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: clippy
@@ -38,7 +38,7 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all
@@ -59,7 +59,7 @@ jobs:
     name: coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: llvm-tools-preview
@@ -86,7 +86,7 @@ jobs:
             --ignore-filename-regex '/(tests?/.*|src/test\.rs)$' \
             --fail-under-lines 98 \
             --fail-under-regions 95
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: coverage-lcov
@@ -96,7 +96,7 @@ jobs:
     name: dependency audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # cargo deny needs cargo metadata, so the pinned toolchain has to be in
       # place first: the dependency graph requires rustc 1.91 or newer.
       - uses: dtolnay/rust-toolchain@1.96.0
@@ -113,7 +113,7 @@ jobs:
     name: build-wasm
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: wasm32v1-none
@@ -130,7 +130,7 @@ jobs:
         run: |
           ls -lh dist
           cat dist/SHA256SUMS
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: contracts-wasm
           path: |
@@ -141,7 +141,7 @@ jobs:
     name: deploy script
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Network-free: fake `stellar` and `build-wasm.sh` commands on PATH.
       - run: ./scripts/test-deploy.sh
 
@@ -149,7 +149,7 @@ jobs:
     name: reproducible build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: wasm32v1-none
@@ -210,7 +210,7 @@ jobs:
     name: doc
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
       - name: Build docs
@@ -222,12 +222,28 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./target/doc
 
+  example-typecheck:
+    name: example-typecheck
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: examples/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+
   bot:
     name: auto-merge bot tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
       - run: node --test .github/scripts/automerge.test.cjs .github/scripts/security-scan.test.cjs
