@@ -5,7 +5,10 @@ use soroban_sdk::{
     Address, Env, String, Vec,
 };
 
-use crate::{ProviderStatus, Registry, RegistryClient, RegistryError, MIN_PRICE_NOTICE_SECS};
+use crate::{
+    ProviderStatus, Registry, RegistryClient, RegistryError, MAX_PROVIDERS_PAGE,
+    MIN_PRICE_NOTICE_SECS,
+};
 
 struct Fixture {
     env: Env,
@@ -572,6 +575,147 @@ fn pausing_absent_service_errors() {
     assert!(!f.client.is_service_available(&provider, &999u32));
 }
 
+/// Clinics are listed in registration order, and pagination pages through them.
+#[test]
+fn list_providers_in_registration_order() {
+    let f = setup();
+
+    let a = Address::generate(&f.env);
+    let b = Address::generate(&f.env);
+    let c = Address::generate(&f.env);
+
+    f.client.register_provider(
+        &a,
+        &String::from_str(&f.env, "A Clinic"),
+        &String::from_str(&f.env, "NG"),
+    );
+    f.client.register_provider(
+        &b,
+        &String::from_str(&f.env, "B Clinic"),
+        &String::from_str(&f.env, "KE"),
+    );
+    f.client.register_provider(
+        &c,
+        &String::from_str(&f.env, "C Clinic"),
+        &String::from_str(&f.env, "GH"),
+    );
+
+    let first = f.client.list_providers(&0u32, &2u32);
+    assert_eq!(first.len(), 2);
+    assert_eq!(first.get_unchecked(0).owner, a);
+    assert_eq!(
+        first.get_unchecked(0).country,
+        String::from_str(&f.env, "NG")
+    );
+    assert_eq!(first.get_unchecked(1).owner, b);
+    assert_eq!(
+        first.get_unchecked(1).country,
+        String::from_str(&f.env, "KE")
+    );
+
+    let second = f.client.list_providers(&2u32, &2u32);
+    assert_eq!(second.len(), 1);
+    assert_eq!(second.get_unchecked(0).owner, c);
+    assert_eq!(
+        second.get_unchecked(0).country,
+        String::from_str(&f.env, "GH")
+    );
+
+    let all = f.client.list_providers(&0u32, &10u32);
+    assert_eq!(all.len(), 3);
+    assert_eq!(all.get_unchecked(0).owner, a);
+    assert_eq!(all.get_unchecked(1).owner, b);
+    assert_eq!(all.get_unchecked(2).owner, c);
+}
+
+/// A `start` beyond the end returns an empty list.
+#[test]
+fn list_providers_start_beyond_end_is_empty() {
+    let f = setup();
+    let provider = Address::generate(&f.env);
+    f.client.register_provider(
+        &provider,
+        &String::from_str(&f.env, "A Clinic"),
+        &String::from_str(&f.env, "NG"),
+    );
+
+    assert_eq!(f.client.list_providers(&1u32, &10u32).len(), 0);
+    assert_eq!(f.client.list_providers(&999u32, &10u32).len(), 0);
+}
+
+/// A limit above `MAX_PROVIDERS_PAGE` is clamped to the cap.
+#[test]
+fn list_providers_limit_is_capped() {
+    let f = setup();
+
+    for _ in 0..60 {
+        let provider = Address::generate(&f.env);
+        f.client.register_provider(
+            &provider,
+            &String::from_str(&f.env, "Clinic"),
+            &String::from_str(&f.env, "NG"),
+        );
+    }
+
+    let first = f.client.list_providers(&0u32, &u32::MAX);
+    assert_eq!(first.len(), MAX_PROVIDERS_PAGE);
+
+    let second = f.client.list_providers(&MAX_PROVIDERS_PAGE, &u32::MAX);
+    assert_eq!(second.len(), 10);
+}
+
+/// An empty registry lists nothing.
+#[test]
+fn list_providers_empty_registry() {
+    let f = setup();
+    assert_eq!(f.client.list_providers(&0u32, &10u32).len(), 0);
+}
+
+/// The counter and index entries get their TTL extended on read, like every
+/// other persistent entry.
+#[test]
+fn list_providers_extends_index_ttl() {
+    let f = setup();
+    let a = Address::generate(&f.env);
+    let b = Address::generate(&f.env);
+    f.client.register_provider(
+        &a,
+        &String::from_str(&f.env, "A Clinic"),
+        &String::from_str(&f.env, "NG"),
+    );
+    f.client.register_provider(
+        &b,
+        &String::from_str(&f.env, "B Clinic"),
+        &String::from_str(&f.env, "KE"),
+    );
+
+    // Jump far enough that the 90-day TTL would lapse on every entry.
+    advance_days(&f, 95);
+
+    // Reading the index restores each lapsed entry and pushes it back out.
+    let providers = f.client.list_providers(&0u32, &10u32);
+    assert_eq!(providers.len(), 2);
+    assert_eq!(providers.get_unchecked(0).owner, a);
+    assert_eq!(providers.get_unchecked(1).owner, b);
+
+    let contract = f.client.address.clone();
+    let count_key = DataKey::ProviderCount;
+    let count_ttl = f.env.as_contract(&contract, || {
+        f.env.storage().persistent().get_ttl(&count_key)
+    });
+    assert_eq!(count_ttl, NINETY_DAYS);
+
+    let index_key = DataKey::ProviderAt(0);
+    let index_ttl = f.env.as_contract(&contract, || {
+        f.env.storage().persistent().get_ttl(&index_key)
+    });
+    assert_eq!(index_ttl, NINETY_DAYS);
+
+    // And each provider record itself is still live.
+    assert_eq!(f.client.get_provider(&a).owner, a);
+    assert_eq!(f.client.get_provider(&b).owner, b);
+}
+
 #[test]
 fn attester_lifecycle() {
     let f = setup();
@@ -867,6 +1011,10 @@ const AUTH_MATRIX: &[AuthCase] = &[
         auth: Auth::Free("none (view)"),
     },
     AuthCase {
+        function: "list_providers",
+        auth: Auth::Free("none (view)"),
+    },
+    AuthCase {
         function: "is_active_provider",
         auth: Auth::Free("none (view)"),
     },
@@ -992,6 +1140,9 @@ fn run_case(f: &AuthFixture, function: &str) -> std::vec::Vec<Address> {
         "get_provider" => {
             activate(&f.f, &f.provider);
             client.get_provider(&f.provider);
+        }
+        "list_providers" => {
+            client.list_providers(&0u32, &10u32);
         }
         "is_active_provider" => {
             activate(&f.f, &f.provider);

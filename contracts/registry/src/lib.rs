@@ -42,6 +42,9 @@ use storage::{
 /// 24 hours, so a funder who has just seen a price can still pay it.
 pub const MIN_PRICE_NOTICE_SECS: u64 = 24 * 60 * 60;
 
+/// Most providers one `list_providers` call may return.
+pub use storage::MAX_PROVIDERS_PAGE;
+
 #[contract]
 pub struct Registry;
 
@@ -91,6 +94,12 @@ impl Registry {
         };
         write_provider(&env, &owner, &provider);
         extend_instance(&env);
+
+        // Append to the registration index so any app can enumerate clinics
+        // without an indexer, in registration order.
+        let count = storage::read_provider_count(&env);
+        storage::write_provider_at(&env, count, &owner);
+        storage::write_provider_count(&env, &(count + 1));
 
         ProviderRegistered {
             provider: owner,
@@ -381,11 +390,36 @@ impl Registry {
         read_provider(&env, &provider_addr)
     }
 
+    /// Providers in registration order, paged by `start` and `limit`.
+    ///
+    /// `start` is the index of the first provider to return; `limit` is capped
+    /// at `MAX_PROVIDERS_PAGE` so one read cannot exceed host limits. Page by
+    /// calling again with `start += returned.len()`. An empty registry or a
+    /// `start` beyond the end returns an empty list. No signature is required;
+    /// this is the on-chain discovery any app or auditor can use instead of
+    /// trusting an indexer.
+    pub fn list_providers(env: Env, start: u32, limit: u32) -> Vec<Provider> {
+        storage::list_providers(&env, start, limit)
+    }
+
     /// The check `voucher` relies on before escrowing any funds.
     pub fn is_active_provider(env: Env, provider_addr: Address) -> bool {
         match read_provider(&env, &provider_addr) {
             Ok(p) => p.status == ProviderStatus::Active,
             Err(_) => false,
+        }
+    }
+
+    /// The country a provider is registered in, as an ISO 3166-1 alpha-2
+    /// code. Empty when the provider is not registered.
+    ///
+    /// The check `sponsor` relies on before matching a voucher for a clinic
+    /// in one of its countries. Declared over primitives so the two
+    /// contracts share no types.
+    pub fn get_provider_country(env: Env, provider_addr: Address) -> String {
+        match read_provider(&env, &provider_addr) {
+            Ok(p) => p.country,
+            Err(_) => String::from_str(&env, ""),
         }
     }
 

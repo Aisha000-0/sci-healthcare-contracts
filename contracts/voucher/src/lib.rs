@@ -54,7 +54,7 @@ use soroban_sdk::{contract, contractimpl, token, Address, BytesN, Env, String};
 pub use events::{
     AdminChanged, AdminProposed, AttestationCapChanged, DisputeResolved, EscrowCapChanged,
     Initialized, VoucherAmountReduced, VoucherAttested, VoucherClaimed, VoucherCreated,
-    VoucherDisputed, VoucherRefunded, VoucherSettled,
+    VoucherDisputed, VoucherRedirected, VoucherRefunded, VoucherSettled,
 };
 pub use interfaces::{ReceiptClient, RegistryClient};
 pub use types::{Config, DataKey, Exposure, Voucher, VoucherError, VoucherStatus};
@@ -242,6 +242,56 @@ impl VoucherEscrow {
         }
         .publish(&env);
         Ok(id)
+    }
+
+    /// Redirects a funded voucher to another active clinic offering the same
+    /// service for no more than the escrowed amount.
+    pub fn redirect(
+        env: Env,
+        funder: Address,
+        voucher_id: u64,
+        new_provider: Address,
+    ) -> Result<(), VoucherError> {
+        funder.require_auth();
+
+        let mut voucher = read_voucher(&env, voucher_id)?;
+        if voucher.funder != funder {
+            return Err(VoucherError::NotAuthorized);
+        }
+        if voucher.status != VoucherStatus::Funded {
+            return Err(VoucherError::InvalidStatus);
+        }
+
+        let config = read_config(&env)?;
+        let registry = RegistryClient::new(&env, &config.registry);
+        if !registry.is_active_provider(&new_provider) {
+            return Err(VoucherError::ProviderNotActive);
+        }
+
+        let price = registry.get_service_price(&new_provider, &voucher.service_code);
+        if price == 0 {
+            return Err(VoucherError::ServiceNotOffered);
+        }
+        if voucher.amount < price {
+            return Err(VoucherError::AmountBelowPrice);
+        }
+        if !registry.is_service_available(&new_provider, &voucher.service_code) {
+            return Err(VoucherError::ServiceUnavailable);
+        }
+
+        let previous_provider = voucher.provider.clone();
+        voucher.provider = new_provider.clone();
+        write_voucher(&env, &voucher);
+
+        VoucherRedirected {
+            funder,
+            voucher_id,
+            previous_provider,
+            new_provider,
+            service_code: voucher.service_code,
+        }
+        .publish(&env);
+        Ok(())
     }
 
     /// Gives back an overpayment without giving up the voucher.
@@ -723,6 +773,34 @@ impl VoucherEscrow {
 
     pub fn get_voucher(env: Env, voucher_id: u64) -> Result<Voucher, VoucherError> {
         read_voucher(&env, voucher_id)
+    }
+
+    /// The fields `sponsor` needs to match this voucher, in one call.
+    ///
+    /// `(beneficiary_ref, funder, provider, service_code, amount, status,
+    /// created_at, expires_at)`, where `status` is the voucher's
+    /// `VoucherStatus` as a number: 0 `Funded`, 1 `Claimed`, 2 `Attested`,
+    /// 3 `Settled`, 4 `Disputed`, 5 `Refunded`. `None` when the voucher
+    /// does not exist.
+    ///
+    /// Declared over primitives so the two contracts share no types and can
+    /// be upgraded independently.
+    #[allow(clippy::type_complexity)]
+    pub fn voucher_summary(
+        env: Env,
+        voucher_id: u64,
+    ) -> Option<(BytesN<32>, Address, Address, u32, i128, u32, u64, u64)> {
+        let voucher = read_voucher(&env, voucher_id).ok()?;
+        Some((
+            voucher.beneficiary_ref,
+            voucher.funder,
+            voucher.provider,
+            voucher.service_code,
+            voucher.amount,
+            voucher.status as u32,
+            voucher.created_at,
+            voucher.expires_at,
+        ))
     }
 
     pub fn get_config(env: Env) -> Result<Config, VoucherError> {

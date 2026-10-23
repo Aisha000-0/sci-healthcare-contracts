@@ -73,6 +73,10 @@ pub enum DataKey {
     Provider(Address),
     Service(Address, u32),
     Attester(Address),
+    /// Total number of registered providers.
+    ProviderCount,
+    /// Provider address at a registration index, in registration order.
+    ProviderAt(u32),
     /// Address nominated by `propose_admin`, awaiting `accept_admin`.
     PendingAdmin,
     /// Most vouchers a clinic accepts outstanding at once; absent means

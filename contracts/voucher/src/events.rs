@@ -118,6 +118,18 @@ pub struct VoucherAmountReduced {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoucherRedirected {
+    #[topic]
+    pub funder: Address,
+    #[topic]
+    pub new_provider: Address,
+    pub voucher_id: u64,
+    pub previous_provider: Address,
+    pub service_code: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DisputeResolved {
     #[topic]
     pub admin: Address,
