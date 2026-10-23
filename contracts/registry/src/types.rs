@@ -79,6 +79,9 @@ pub enum DataKey {
     ProviderAt(u32),
     /// Address nominated by `propose_admin`, awaiting `accept_admin`.
     PendingAdmin,
+    /// Most vouchers a clinic accepts outstanding at once; absent means
+    /// unlimited.
+    Capacity(Address),
 }
 
 #[contracterror]

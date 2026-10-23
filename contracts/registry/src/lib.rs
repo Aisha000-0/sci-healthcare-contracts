@@ -26,16 +26,16 @@ use sci_common as common;
 use soroban_sdk::{contract, contractimpl, Address, Env, String, Vec};
 
 pub use events::{
-    AdminChanged, AdminProposed, AttesterAdded, AttesterRemoved, Initialized, ProviderRegistered,
-    ProviderStatusChanged, ServiceAvailabilityChanged, ServicePriceScheduled, ServiceRemoved,
-    ServiceUpserted,
+    AdminChanged, AdminProposed, AttesterAdded, AttesterRemoved, CapacityChanged, Initialized,
+    ProviderRegistered, ProviderStatusChanged, ServiceAvailabilityChanged, ServicePriceScheduled,
+    ServiceRemoved, ServiceUpserted,
 };
 pub use types::{DataKey, Provider, ProviderStatus, RegistryError, ServiceItem};
 
 use storage::{
-    extend_instance, has_admin, has_provider, read_admin, read_attester, read_pending_admin,
-    read_provider, read_service, remove_service as storage_remove_service, write_admin,
-    write_attester, write_provider, write_service,
+    extend_instance, has_admin, has_provider, read_admin, read_attester, read_capacity,
+    read_pending_admin, read_provider, read_service, remove_service as storage_remove_service,
+    write_admin, write_attester, write_capacity, write_provider, write_service,
 };
 
 /// Least notice a clinic must give before a scheduled price takes effect.
@@ -299,6 +299,34 @@ impl Registry {
         Ok(())
     }
 
+    /// Declares how many vouchers this clinic can have outstanding (funded but
+    /// not yet settled or refunded) at once. `0` means unlimited, which is
+    /// also the default for a clinic that never sets it.
+    ///
+    /// `voucher` refuses to fund a new voucher at a clinic already at its
+    /// capacity (`ProviderAtCapacity`), so funders' money is not stuck at a
+    /// clinic that cannot see the patients before the vouchers expire.
+    /// Lowering the capacity below the current count affects only new
+    /// vouchers; outstanding ones settle or refund as normal.
+    pub fn set_capacity(
+        env: Env,
+        provider_addr: Address,
+        max_outstanding: u32,
+    ) -> Result<(), RegistryError> {
+        provider_addr.require_auth();
+
+        read_provider(&env, &provider_addr)?;
+        write_capacity(&env, &provider_addr, max_outstanding);
+        extend_instance(&env);
+
+        CapacityChanged {
+            provider: provider_addr,
+            max_outstanding,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
     /// Grants attester rights. Admin only.
     pub fn add_attester(env: Env, admin: Address, attester: Address) -> Result<(), RegistryError> {
         Self::require_admin(&env, &admin)?;
@@ -458,6 +486,12 @@ impl Registry {
 
     pub fn is_attester(env: Env, addr: Address) -> bool {
         read_attester(&env, &addr)
+    }
+
+    /// Most vouchers the clinic accepts outstanding at once; `0` is
+    /// unlimited. `voucher` reads this before funding.
+    pub fn get_capacity(env: Env, provider_addr: Address) -> u32 {
+        read_capacity(&env, &provider_addr)
     }
 
     /// Crate version this contract was built from, e.g. `"0.2.0"`.

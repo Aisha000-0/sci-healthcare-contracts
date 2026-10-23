@@ -6,7 +6,7 @@ use soroban_sdk::{
 };
 
 use crate::{
-    VoucherError, VoucherEscrow, VoucherEscrowClient, VoucherStatus,
+    Exposure, VoucherError, VoucherEscrow, VoucherEscrowClient, VoucherStatus,
     DEFAULT_MAX_ATTESTATIONS_PER_DAY,
 };
 use sci_receipt::{ReceiptBook, ReceiptBookClient};
@@ -2431,12 +2431,24 @@ const AUTH_MATRIX: &[AuthCase] = &[
         auth: signer("`admin`", admin_addr),
     },
     AuthCase {
+        function: "set_max_escrow_per_provider",
+        auth: signer("`admin`", admin_addr),
+    },
+    AuthCase {
         function: "propose_admin",
         auth: signer("`admin`", admin_addr),
     },
     AuthCase {
         function: "accept_admin",
         auth: signer("`new_admin`", new_admin_addr),
+    },
+    AuthCase {
+        function: "get_max_escrow_per_provider",
+        auth: Auth::Free("none (view)"),
+    },
+    AuthCase {
+        function: "get_exposure",
+        auth: Auth::Free("none (view)"),
     },
     AuthCase {
         function: "get_attestation_cap",
@@ -2580,6 +2592,15 @@ fn run_case(f: &AuthFixture, function: &str) -> std::vec::Vec<Address> {
         }
         "set_attestation_cap" => {
             voucher.set_attestation_cap(&f.f.admin, &10);
+        }
+        "set_max_escrow_per_provider" => {
+            voucher.set_max_escrow_per_provider(&f.f.admin, &CONSULT_PRICE);
+        }
+        "get_max_escrow_per_provider" => {
+            voucher.get_max_escrow_per_provider();
+        }
+        "get_exposure" => {
+            voucher.get_exposure(&f.f.provider);
         }
         "get_attestation_cap" => {
             voucher.get_attestation_cap();
@@ -3443,4 +3464,256 @@ fn frozen_funder_returns_transfer_failed_on_refund() {
     let err = f.voucher.try_refund(&id).err().unwrap().unwrap();
     assert_eq!(err, VoucherError::TokenTransferFailed);
     assert_eq!(f.voucher.get_voucher(&id).status, VoucherStatus::Funded);
+}
+
+// ----- clinic capacity and per-clinic escrow cap -----
+
+fn settle_one(f: &Fixture, id: u64) {
+    f.voucher.claim(&f.provider, &id);
+    f.voucher.attest(&f.attester, &id);
+    advance(&f.env, DISPUTE_WINDOW + 1);
+    f.voucher.settle(&id);
+}
+
+fn try_fund(f: &Fixture, amount: i128) -> Result<u64, VoucherError> {
+    match f.voucher.try_create_voucher(
+        &f.funder,
+        &patient(&f.env),
+        &f.provider,
+        &CONSULT,
+        &amount,
+        &(f.env.ledger().timestamp() + 30 * 24 * 60 * 60),
+    ) {
+        Ok(Ok(id)) => Ok(id),
+        Err(Ok(e)) => Err(e),
+        other => panic!("unexpected result {other:?}"),
+    }
+}
+
+#[test]
+fn exposure_tracks_open_vouchers() {
+    let f = setup();
+    assert_eq!(f.voucher.get_exposure(&f.provider), Exposure::default());
+
+    let a = fund(&f);
+    fund(&f);
+    assert_eq!(
+        f.voucher.get_exposure(&f.provider),
+        Exposure {
+            vouchers: 2,
+            value: 2 * CONSULT_PRICE
+        }
+    );
+
+    settle_one(&f, a);
+    assert_eq!(
+        f.voucher.get_exposure(&f.provider),
+        Exposure {
+            vouchers: 1,
+            value: CONSULT_PRICE
+        }
+    );
+}
+
+#[test]
+fn capacity_rejects_vouchers_until_one_settles() {
+    let f = setup();
+    f.registry.set_capacity(&f.provider, &2);
+
+    let first = fund(&f);
+    fund(&f);
+    assert_eq!(
+        try_fund(&f, CONSULT_PRICE),
+        Err(VoucherError::ProviderAtCapacity)
+    );
+
+    settle_one(&f, first);
+    assert!(try_fund(&f, CONSULT_PRICE).is_ok(), "settling frees a slot");
+    assert_eq!(
+        try_fund(&f, CONSULT_PRICE),
+        Err(VoucherError::ProviderAtCapacity)
+    );
+}
+
+#[test]
+fn capacity_frees_a_slot_on_refund() {
+    let f = setup();
+    f.registry.set_capacity(&f.provider, &1);
+
+    let id = fund(&f);
+    assert_eq!(
+        try_fund(&f, CONSULT_PRICE),
+        Err(VoucherError::ProviderAtCapacity)
+    );
+
+    advance(&f.env, 31 * 24 * 60 * 60);
+    f.voucher.refund(&id);
+    assert_eq!(f.voucher.get_exposure(&f.provider), Exposure::default());
+    assert!(
+        try_fund(&f, CONSULT_PRICE).is_ok(),
+        "refunding frees a slot"
+    );
+}
+
+#[test]
+fn capacity_frees_a_slot_when_a_dispute_resolves() {
+    let f = setup();
+    f.registry.set_capacity(&f.provider, &1);
+
+    let id = fund(&f);
+    f.voucher.claim(&f.provider, &id);
+    f.voucher.dispute(&f.funder, &id, &1u32);
+    assert_eq!(
+        try_fund(&f, CONSULT_PRICE),
+        Err(VoucherError::ProviderAtCapacity)
+    );
+
+    f.voucher.resolve_dispute(&f.admin, &id, &true);
+    assert!(try_fund(&f, CONSULT_PRICE).is_ok());
+}
+
+#[test]
+fn zero_capacity_is_unlimited() {
+    let f = setup();
+    f.registry.set_capacity(&f.provider, &0);
+    for _ in 0..5 {
+        fund(&f);
+    }
+    assert_eq!(f.voucher.get_exposure(&f.provider).vouchers, 5);
+}
+
+#[test]
+fn escrow_cap_allows_exactly_the_cap() {
+    let f = setup();
+    f.voucher
+        .set_max_escrow_per_provider(&f.admin, &(2 * CONSULT_PRICE));
+    assert_eq!(f.voucher.get_max_escrow_per_provider(), 2 * CONSULT_PRICE);
+
+    fund(&f);
+    fund(&f);
+    // At the cap: one stroop more is refused.
+    assert_eq!(
+        try_fund(&f, CONSULT_PRICE),
+        Err(VoucherError::EscrowCapReached)
+    );
+    assert_eq!(f.voucher.get_exposure(&f.provider).value, 2 * CONSULT_PRICE);
+}
+
+#[test]
+fn escrow_cap_counts_the_new_amount() {
+    let f = setup();
+    f.voucher
+        .set_max_escrow_per_provider(&f.admin, &(CONSULT_PRICE + 5));
+
+    fund(&f);
+    // 5 stroops of room is below the listed price, so a voucher cannot fit.
+    assert_eq!(
+        try_fund(&f, CONSULT_PRICE),
+        Err(VoucherError::EscrowCapReached)
+    );
+}
+
+#[test]
+fn escrow_cap_releases_value_on_settle_and_refund() {
+    let f = setup();
+    f.voucher
+        .set_max_escrow_per_provider(&f.admin, &CONSULT_PRICE);
+
+    let id = fund(&f);
+    assert_eq!(
+        try_fund(&f, CONSULT_PRICE),
+        Err(VoucherError::EscrowCapReached)
+    );
+    settle_one(&f, id);
+
+    let id = try_fund(&f, CONSULT_PRICE).expect("settle released the value");
+    assert_eq!(
+        try_fund(&f, CONSULT_PRICE),
+        Err(VoucherError::EscrowCapReached)
+    );
+    advance(&f.env, 31 * 24 * 60 * 60);
+    f.voucher.refund(&id);
+
+    assert!(
+        try_fund(&f, CONSULT_PRICE).is_ok(),
+        "refund released the value"
+    );
+}
+
+#[test]
+fn escrow_cap_is_admin_only_and_not_negative() {
+    let f = setup();
+    let stranger = Address::generate(&f.env);
+    assert_eq!(
+        f.voucher.try_set_max_escrow_per_provider(&stranger, &1),
+        Err(Ok(VoucherError::NotAuthorized))
+    );
+    assert_eq!(
+        f.voucher.try_set_max_escrow_per_provider(&f.admin, &-1),
+        Err(Ok(VoucherError::InvalidEscrowCap))
+    );
+    assert_eq!(f.voucher.get_max_escrow_per_provider(), 0);
+}
+
+#[test]
+fn lowering_the_escrow_cap_does_not_trap_funded_vouchers() {
+    let f = setup();
+    let id = fund(&f);
+    fund(&f);
+    f.voucher.set_max_escrow_per_provider(&f.admin, &1);
+
+    assert_eq!(
+        try_fund(&f, CONSULT_PRICE),
+        Err(VoucherError::EscrowCapReached)
+    );
+    settle_one(&f, id);
+    assert_eq!(f.voucher.get_voucher(&id).status, VoucherStatus::Settled);
+}
+
+#[test]
+fn escrow_cap_changed_event_snapshot() {
+    let f = setup();
+
+    f.voucher
+        .set_max_escrow_per_provider(&f.admin, &(5 * CONSULT_PRICE));
+
+    let e = one_event(&f);
+    assert_layout(&e, "escrow_cap_changed", &[ScVal::from(&f.admin)], &["max"]);
+    assert_eq!(field_i128(&e, "max"), 5 * CONSULT_PRICE);
+}
+
+#[test]
+fn split_resolution_releases_open_escrow_and_exposure() {
+    let f = setup();
+    let id = claimed(&f);
+    f.voucher.dispute(&f.funder, &id, &1u32);
+
+    f.voucher.resolve_split(&f.admin, &id, &(CONSULT_PRICE / 2));
+
+    let (open_escrow, token_balance) = f.voucher.escrow_summary();
+    assert_eq!(
+        open_escrow, 0,
+        "the split voucher still counts as open escrow"
+    );
+    assert_eq!(token_balance, 0);
+    assert_eq!(f.voucher.get_exposure(&f.provider), Exposure::default());
+}
+
+#[test]
+fn reducing_a_voucher_lowers_the_clinics_exposure() {
+    let f = setup();
+    fund_overpaid(&f, CONSULT_PRICE * 2);
+    let id = fund_overpaid(&f, CONSULT_PRICE * 2);
+
+    f.voucher.reduce_amount(&f.funder, &id, &CONSULT_PRICE);
+
+    assert_eq!(
+        f.voucher.get_exposure(&f.provider),
+        Exposure {
+            vouchers: 2,
+            value: 3 * CONSULT_PRICE
+        }
+    );
+    let (open_escrow, _) = f.voucher.escrow_summary();
+    assert_eq!(open_escrow, 3 * CONSULT_PRICE);
 }

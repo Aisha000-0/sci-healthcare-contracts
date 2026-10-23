@@ -99,6 +99,24 @@ pub enum DataKey {
     /// refunded. Kept in instance storage and updated on every movement of
     /// funds, so `escrow_summary` can report it without scanning vouchers.
     OpenEscrow,
+    /// What a clinic currently has in escrow: see `Exposure`.
+    Exposure(Address),
+    /// Most value one clinic may hold in escrow at once. Unset or 0 means
+    /// unlimited.
+    EscrowCap,
+}
+
+/// A clinic's open vouchers: every voucher funded to it that has not yet
+/// been settled or refunded, counted and summed.
+///
+/// Raised by `create_voucher` and lowered when a voucher settles or refunds,
+/// so it backs both the clinic's declared capacity and the protocol's
+/// per-clinic escrow cap.
+#[contracttype]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Exposure {
+    pub vouchers: u32,
+    pub value: i128,
 }
 
 #[contracterror]
@@ -143,6 +161,14 @@ pub enum VoucherError {
     /// (deauthorized) the escrow or the recipient. Nothing moved; the voucher
     /// is unchanged and the call can be retried once the freeze is lifted.
     TokenTransferFailed = 24,
+    /// The clinic already has as many vouchers outstanding as the capacity it
+    /// declared in the registry.
+    ProviderAtCapacity = 25,
+    /// Funding this voucher would take the clinic's escrow above the
+    /// per-clinic cap.
+    EscrowCapReached = 26,
+    /// The per-clinic escrow cap cannot be negative.
+    InvalidEscrowCap = 27,
 }
 
 /// Maps the shared helpers' failures onto this contract's error numbers, so

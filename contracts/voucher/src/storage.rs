@@ -3,7 +3,7 @@ use soroban_sdk::{Address, Env};
 
 use crate::DEFAULT_MAX_ATTESTATIONS_PER_DAY;
 
-use crate::types::{Config, DataKey, Voucher, VoucherError};
+use crate::types::{Config, DataKey, Exposure, Voucher, VoucherError};
 
 pub(crate) fn extend_instance(env: &Env) {
     common::extend_instance(env);
@@ -114,4 +114,34 @@ pub(crate) fn write_attestations(env: &Env, attester: &Address, day: u64, count:
     env.storage()
         .temporary()
         .extend_ttl(&key, common::ATTESTATIONS_TTL, common::ATTESTATIONS_TTL);
+}
+
+/// What `provider` currently holds in escrow; empty if nothing.
+pub(crate) fn read_exposure(env: &Env, provider: &Address) -> Exposure {
+    let key = DataKey::Exposure(provider.clone());
+    match env.storage().persistent().get(&key) {
+        Some(exposure) => {
+            common::extend_persistent(env, &key);
+            exposure
+        }
+        None => Exposure::default(),
+    }
+}
+
+pub(crate) fn write_exposure(env: &Env, provider: &Address, exposure: &Exposure) {
+    let key = DataKey::Exposure(provider.clone());
+    env.storage().persistent().set(&key, exposure);
+    common::extend_persistent(env, &key);
+}
+
+/// The per-clinic escrow cap; 0 (unlimited) when never set.
+pub(crate) fn read_escrow_cap(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::EscrowCap)
+        .unwrap_or(0)
+}
+
+pub(crate) fn write_escrow_cap(env: &Env, cap: i128) {
+    env.storage().instance().set(&DataKey::EscrowCap, &cap);
 }
