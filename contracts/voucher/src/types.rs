@@ -57,6 +57,22 @@ pub struct Voucher {
     pub attester: Option<Address>,
 }
 
+/// Optional terms a funder can attach to a voucher with
+/// `create_voucher_with_options`. Both default to off, and a voucher funded
+/// with `create_voucher` behaves exactly as before.
+#[contracttype]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct VoucherOptions {
+    /// SHA-256 of a secret the funder gives the patient. When set, the clinic
+    /// can only claim with `claim_with_proof`, revealing the secret, which
+    /// shows it had the patient in front of it.
+    pub presence_commitment: Option<BytesN<32>>,
+    /// Seconds the funder has to dispute after attestation, in place of the
+    /// protocol-wide `Config.dispute_window`. Must lie within the dispute
+    /// window bounds.
+    pub dispute_window: Option<u64>,
+}
+
 /// Protocol-level settings, fixed at initialization.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -95,6 +111,12 @@ pub enum DataKey {
     /// Attestations made by an attester on a UTC day (`timestamp / 86400`).
     /// Temporary storage: it only has to outlive the day it counts.
     Attestations(Address, u64),
+    /// A voucher's `VoucherOptions`. Written only for vouchers that set one,
+    /// so a plain voucher pays for no extra storage.
+    Options(u64),
+    /// Shortest and longest per-voucher dispute window a funder may choose.
+    /// Unset means `DEFAULT_DISPUTE_WINDOW_BOUNDS`.
+    DisputeWindowBounds,
     /// Total amount held in escrow by vouchers that are not yet settled or
     /// refunded. Kept in instance storage and updated on every movement of
     /// funds, so `escrow_summary` can report it without scanning vouchers.
@@ -169,6 +191,16 @@ pub enum VoucherError {
     EscrowCapReached = 26,
     /// The per-clinic escrow cap cannot be negative.
     InvalidEscrowCap = 27,
+    /// This voucher was funded with a presence commitment, so the clinic must
+    /// claim it with `claim_with_proof`.
+    PresenceProofRequired = 28,
+    /// The secret does not hash to the voucher's presence commitment.
+    InvalidPresenceProof = 29,
+    /// `claim_with_proof` on a voucher funded without a presence commitment.
+    NoPresenceCommitment = 30,
+    /// The chosen dispute window is outside the allowed bounds, or the bounds
+    /// themselves are invalid.
+    InvalidDisputeWindow = 31,
 }
 
 /// Maps the shared helpers' failures onto this contract's error numbers, so

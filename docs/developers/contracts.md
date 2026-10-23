@@ -182,11 +182,18 @@ pub struct Config {
     pub fee_account: Address,
 }
 
+pub struct VoucherOptions {                       // create_voucher_with_options
+    pub presence_commitment: Option<BytesN<32>>,  // sha256 of the patient's secret
+    pub dispute_window: Option<u64>,              // per-voucher window, within the bounds
+}
+
 pub struct Exposure {            // a clinic's open vouchers
     pub vouchers: u32,           // funded and not yet settled or refunded
     pub value: i128,             // what they escrow in total
 }
 ```
+
+`Voucher` is what every function takes and returns. In storage it is kept positionally — an XDR vec of its values, without the id, which is already in the key — rather than as a map carrying every field name; for an attested voucher that is 228 bytes instead of 464, about half, and rent is charged on entry size (`stored_voucher_is_smaller_than_the_named_layout` prints both). `VoucherOptions` lives in its own entry, written only for a voucher that sets one.
 
 ### Functions
 
@@ -194,9 +201,11 @@ pub struct Exposure {            // a clinic's open vouchers
 | --- | --- | --- | --- |
 | `initialize` | `admin, registry, receipt_book, token, dispute_window, fee_bps, attester_share_bps, fee_account` | `()` | once |
 | `create_voucher` | `funder, beneficiary_ref, provider, service_code, amount, expires_at` | `u64` | `funder` |
+| `create_voucher_with_options` | `funder, beneficiary_ref, provider, service_code, amount, expires_at, options: VoucherOptions` | `u64` | `funder` |
 | `reduce_amount` | `funder, voucher_id, new_amount` | `()` | `funder` |
 | `redirect` | `funder, voucher_id, new_provider` | `()` | `funder` |
 | `claim` | `provider, voucher_id` | `()` | `provider` |
+| `claim_with_proof` | `provider, voucher_id, secret: Bytes` | `()` | `provider` |
 | `attest` | `attester, voucher_id` | `()` | `attester` |
 | `dispute` | `funder, voucher_id, reason_code` | `()` | `funder` |
 | `settle` | `voucher_id` | `()` | **none** |
@@ -204,10 +213,13 @@ pub struct Exposure {            // a clinic's open vouchers
 | `resolve_dispute` | `admin, voucher_id, refund_funder: bool` | `()` | `admin` |
 | `resolve_split` | `admin, voucher_id, to_provider: i128` | `()` | `admin` |
 | `set_attestation_cap` | `admin, cap: u32` | `()` | `admin` |
+| `set_dispute_window_bounds` | `admin, min: u64, max: u64` | `()` | `admin` |
 | `set_max_escrow_per_provider` | `admin, max: i128` | `()` | `admin` |
 | `propose_admin` | `admin, new_admin` | `()` | `admin` |
 | `accept_admin` | `new_admin` | `()` | `new_admin` |
 | `get_voucher` | `voucher_id` | `Voucher` | view |
+| `get_voucher_options` | `voucher_id` | `VoucherOptions` | view |
+| `get_dispute_window_bounds` | — | `(u64, u64)` | view |
 | `refundable_at` | `voucher_id` | `u64` | view |
 | `get_max_escrow_per_provider` | — | `i128` | view |
 | `get_exposure` | `provider` | `Exposure` | view |
@@ -232,9 +244,11 @@ Every public function, with the exact signer it demands. `AUTH_MATRIX` in `contr
 | --- | --- |
 | `initialize` | none (one-shot) |
 | `create_voucher` | `funder` |
+| `create_voucher_with_options` | `funder` |
 | `reduce_amount` | `funder` |
 | `redirect` | `funder` |
 | `claim` | `provider` |
+| `claim_with_proof` | `provider` |
 | `attest` | `attester` |
 | `dispute` | `funder` |
 | `settle` | none (permissionless) |
@@ -242,9 +256,12 @@ Every public function, with the exact signer it demands. `AUTH_MATRIX` in `contr
 | `resolve_dispute` | `admin` |
 | `resolve_split` | `admin` |
 | `set_attestation_cap` | `admin` |
+| `set_dispute_window_bounds` | `admin` |
 | `set_max_escrow_per_provider` | `admin` |
 | `propose_admin` | `admin` |
 | `accept_admin` | `new_admin` |
+| `get_dispute_window_bounds` | none (view) |
+| `get_voucher_options` | none (view) |
 | `get_max_escrow_per_provider` | none (view) |
 | `get_exposure` | none (view) |
 | `get_attestation_cap` | none (view) |
@@ -271,9 +288,15 @@ rejects the voucher's own provider even if it holds that role.
 
 **`reduce_amount`** — caller is the funder of this voucher (`NotAuthorized`); status is `Funded` (`InvalidStatus`); `new_amount` > 0 (`InvalidAmount`) and strictly below the escrowed amount (`AmountNotReduced`); the service is still listed (`ServiceNotOffered`); and `new_amount` ≥ the price the registry lists **at call time** (`AmountBelowPrice`). The difference goes straight back to the funder and the escrow keeps the rest; no fee is taken on money that never became care, and the `open_escrow` total follows the difference down. The price at call time is the floor, not the price at funding time: a clinic that has raised its price cannot have a funded voucher reduced below that price, and a clinic that has lowered it frees the funder to reduce further. A voucher whose service has been delisted cannot be reduced at all — there is no floor to reduce towards — and is refunded at expiry instead. Once the clinic has claimed the voucher the amount is what the clinic expects to be paid, so the reduction is closed.
 
-**`claim`** — caller is the named provider; provider is still `Active` in the registry; status is `Funded`; not expired.
+**`create_voucher_with_options`** — everything `create_voucher` checks, plus: a `dispute_window`, when set, lies within `get_dispute_window_bounds()` (`InvalidDisputeWindow`). With both options unset it is exactly `create_voucher`.
 
-**`attest`** — caller is a registry attester; caller is **not** the provider; status is `Claimed`; the attester has attestations left today. Stores the attester on the voucher and sets `dispute_deadline = now + dispute_window`.
+**`claim`** — caller is the named provider; provider is still `Active` in the registry; status is `Funded`; not expired; the voucher has no presence commitment (`PresenceProofRequired`).
+
+**`claim_with_proof`** — the same checks as `claim`, for a voucher funded with a `presence_commitment`: `sha256(secret)` must equal it (`InvalidPresenceProof`), and a voucher without one is `NoPresenceCommitment`. The funder gives the secret to the patient, so a claim shows the clinic had the patient in front of it rather than only saying so. The secret becomes public with the claim; it was only ever good for that voucher.
+
+**`attest`** — caller is a registry attester; caller is **not** the provider; status is `Claimed`; the attester has attestations left today. Stores the attester on the voucher and sets `dispute_deadline = now + window`, where `window` is the voucher's own `dispute_window` if it was funded with one and `Config.dispute_window` otherwise.
+
+**`set_dispute_window_bounds`** — caller is admin; `1 ≤ min ≤ max` (`InvalidDisputeWindow`). The range a funder's per-voucher window must fall in; `DEFAULT_DISPUTE_WINDOW_BOUNDS` is one day to thirty. Applies to vouchers funded afterwards. Emits `dispute_window_bounds_changed`.
 
 **`set_attestation_cap`** — caller is admin; `cap` ≥ 1 (`InvalidAttestationCap`). Each attester may attest at most `cap` vouchers per UTC day (`timestamp / 86400`); the next is rejected with `AttestationCapReached` until midnight UTC, when the counter resets. The default is `DEFAULT_MAX_ATTESTATIONS_PER_DAY` (100). Counters live in temporary storage keyed by `(attester, day)`. The cap bounds what a stolen attester key can confirm before the admin removes it from the registry; `attestations_left(attester)` and the `remaining_today` field of `voucher_attested` show how close an attester is.
 
@@ -314,6 +337,10 @@ rejects the voucher's own provider even if it holds that role.
 |  |  | 25 | `ProviderAtCapacity` |
 |  |  | 26 | `EscrowCapReached` |
 |  |  | 27 | `InvalidEscrowCap` |
+|  |  | 28 | `PresenceProofRequired` |
+|  |  | 29 | `InvalidPresenceProof` |
+|  |  | 30 | `NoPresenceCommitment` |
+|  |  | 31 | `InvalidDisputeWindow` |
 
 ### Events
 
@@ -329,6 +356,7 @@ rejects the voucher's own provider even if it holds that role.
 | `voucher_redirected` | `funder`, `new_provider` | `voucher_id`, `previous_provider`, `service_code` |
 | `dispute_resolved` | `admin` | `voucher_id`, `refunded_funder`, `to_provider`, `fee`, `to_funder` |
 | `attestation_cap_changed` | `admin` | `cap` |
+| `dispute_window_bounds_changed` | `admin` | `min`, `max` |
 | `escrow_cap_changed` | `admin` | `max` |
 
 > Fields listed under **Topics** are published in the event's topic list, **not** in its data map. An indexer reading them off the data map gets `undefined`.
