@@ -345,6 +345,7 @@ pub struct Receipt {
 | `mint` | `minter, voucher_id, beneficiary_ref, provider, service_code, amount` | `()` | `minter` |
 | `get_receipt` | `voucher_id` | `Receipt` | view |
 | `count_for` | `beneficiary_ref` | `u32` | view |
+| `provider_stats` | `provider` | `(u32, i128)` | view |
 | `receipts_of_provider` | `provider, start, limit` | `Vec<Receipt>` | view |
 | `name` | — | `String` | none (view) |
 | `symbol` | — | `String` | none (view) |
@@ -362,6 +363,8 @@ Receipts are soulbound: there is deliberately no transfer function, so a receipt
 
 `mint` also appends the voucher id to a per-provider index, so a clinic can prove its track record to a funder or auditor without an indexer. `receipts_of_provider(provider, start, limit)` returns that clinic's receipts in mint order, newest last. `limit` is capped at `MAX_RECEIPTS_PAGE` (50); page with `start += returned.len()`. The index is keyed by provider address, so two clinics' receipts never mix, and a provider with no receipts gets an empty vector rather than an error.
 
+**`provider_stats`** — a clinic's on-chain track record in one call: `(count, total_amount)`, the receipts minted for that provider and the sum of their amounts, read straight from `ProviderCount(provider)` and `ProviderTotal(provider)`. Exact and read-only: no signature, no indexer, and a provider with no receipts gets `(0, 0)` rather than an error. Both entries are extended on read like every other persistent entry. `mint` keeps both with **checked arithmetic** (`checked_add`): a count or total that would overflow is refused with `MathOverflow` (#9) instead of wrapping, so a clinic's record can never understate what it was paid.
+
 ### Authorisation matrix
 
 Every public function, with the exact signer it demands. `AUTH_MATRIX` in `contracts/receipt/src/test.rs` drives both `authorisation_matrix_matches_every_public_function` and this table.
@@ -378,6 +381,7 @@ Every public function, with the exact signer it demands. `AUTH_MATRIX` in `contr
 | `get_pending_minter` | none (view) |
 | `get_receipt` | none (view) |
 | `count_for` | none (view) |
+| `provider_stats` | none (view) |
 | `receipts_of_provider` | none (view) |
 | `name` | none (view) |
 | `symbol` | none (view) |
@@ -398,6 +402,7 @@ Every public function, with the exact signer it demands. `AUTH_MATRIX` in `contr
 | 6 | `InvalidAmount` |
 | 7 | `NoPendingAdmin` |
 | 8 | `NoPendingMinter` |
+| 9 | `MathOverflow` |
 
 ### Events
 
@@ -574,7 +579,7 @@ stays in the live ledger. These are the numbers, all in ledgers:
 | `Voucher(id)` | persistent | every read and write | 30 days | 90 days |
 | `Provider`, `Service`, `Attester` | persistent | every read and write | 30 days | 90 days |
 | `Receipt(id)`, `Count(beneficiary_ref)` | persistent | every read and write | 30 days | 90 days |
-| `ProviderCount(provider)`, `ProviderReceipt(provider, index)` | persistent | every mint and `receipts_of_provider` read | 30 days | 90 days |
+| `ProviderCount(provider)`, `ProviderTotal(provider)`, `ProviderReceipt(provider, index)` | persistent | every mint, and `receipts_of_provider` / `provider_stats` reads | 30 days | 90 days |
 | Sponsor `Sponsor(address)`, `Match(id)`, `OriginalOf(id)` | persistent | every read and write | 30 days | 90 days |
 | Faucet `LastDrip(address)` | temporary | every drip | 1 day | 7 days |
 | Faucet `LifetimeDripped(address)` | persistent | every drip and lifetime-cap read | 30 days | 90 days |
