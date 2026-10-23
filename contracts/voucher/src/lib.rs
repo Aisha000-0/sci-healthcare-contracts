@@ -53,17 +53,19 @@ use soroban_sdk::{contract, contractimpl, token, Address, Bytes, BytesN, Env, St
 #[allow(unused_imports)]
 pub use events::{
     AdminChanged, AdminProposed, AttestationCapChanged, DisputeResolved,
-    DisputeWindowBoundsChanged, Initialized, VoucherAmountReduced, VoucherAttested, VoucherClaimed,
-    VoucherCreated, VoucherDisputed, VoucherRedirected, VoucherRefunded, VoucherSettled,
+    DisputeWindowBoundsChanged, EscrowCapChanged, Initialized, VoucherAmountReduced,
+    VoucherAttested, VoucherClaimed, VoucherCreated, VoucherDisputed, VoucherRedirected,
+    VoucherRefunded, VoucherSettled,
 };
 pub use interfaces::{ReceiptClient, RegistryClient};
-pub use types::{Config, DataKey, Voucher, VoucherError, VoucherOptions, VoucherStatus};
+pub use types::{Config, DataKey, Exposure, Voucher, VoucherError, VoucherOptions, VoucherStatus};
 
 use storage::{
     bump_next_id, decrease_open_escrow, extend_instance, has_config, increase_open_escrow,
     peek_next_id, read_attestation_cap, read_attestations, read_config, read_dispute_window_bounds,
-    read_open_escrow, read_options, read_voucher, write_attestation_cap, write_attestations,
-    write_config, write_dispute_window_bounds, write_options, write_voucher,
+    read_escrow_cap, read_exposure, read_open_escrow, read_options, read_voucher,
+    write_attestation_cap, write_attestations, write_config, write_dispute_window_bounds,
+    write_escrow_cap, write_exposure, write_options, write_voucher,
 };
 
 const BPS_DENOMINATOR: i128 = 10_000;
@@ -319,8 +321,18 @@ impl VoucherEscrow {
         let token_client = token::Client::new(&env, &config.token);
         Self::ensure_escrow_covers(&env, &token_client, voucher.amount)?;
         Self::send(&env, &token_client, &funder, difference)?;
-        // The difference has left escrow, so the running total follows it.
+        // The difference has left escrow, so the running total and the
+        // clinic's exposure follow it. The voucher itself stays open.
         decrease_open_escrow(&env, difference)?;
+        let exposure = read_exposure(&env, &voucher.provider);
+        write_exposure(
+            &env,
+            &voucher.provider,
+            &Exposure {
+                vouchers: exposure.vouchers,
+                value: (exposure.value - difference).max(0),
+            },
+        );
 
         let previous_amount = voucher.amount;
         voucher.amount = new_amount;
@@ -668,6 +680,30 @@ impl VoucherEscrow {
         Ok(())
     }
 
+    /// Sets the most value one clinic may hold in escrow at once, across all
+    /// its open vouchers. `0` means unlimited, the default.
+    ///
+    /// A limit on loss while clinic verification is young: if a verified
+    /// clinic turns out to be fraudulent, at most this much is exposed to it.
+    /// Takes effect for new vouchers only; vouchers already funded settle or
+    /// refund as normal even if the clinic is above a lowered cap.
+    pub fn set_max_escrow_per_provider(
+        env: Env,
+        admin: Address,
+        max: i128,
+    ) -> Result<(), VoucherError> {
+        let config = read_config(&env)?;
+        common::require_admin(&config.admin, &admin)?;
+        if max < 0 {
+            return Err(VoucherError::InvalidEscrowCap);
+        }
+
+        write_escrow_cap(&env, max);
+        extend_instance(&env);
+        EscrowCapChanged { admin, max }.publish(&env);
+        Ok(())
+    }
+
     // ----- views -----
 
     /// `(min, max)` seconds a funder's per-voucher dispute window may take.
@@ -679,6 +715,16 @@ impl VoucherEscrow {
     pub fn get_voucher_options(env: Env, voucher_id: u64) -> Result<VoucherOptions, VoucherError> {
         read_voucher(&env, voucher_id)?;
         Ok(read_options(&env, voucher_id))
+    }
+
+    /// Most value one clinic may hold in escrow at once; `0` is unlimited.
+    pub fn get_max_escrow_per_provider(env: Env) -> i128 {
+        read_escrow_cap(&env)
+    }
+
+    /// The clinic's open vouchers: how many, and how much they escrow.
+    pub fn get_exposure(env: Env, provider: Address) -> Exposure {
+        read_exposure(&env, &provider)
     }
 
     /// Most attestations one attester may make per UTC day.
@@ -832,12 +878,36 @@ impl VoucherEscrow {
             return Err(VoucherError::ServiceUnavailable);
         }
 
+        // The clinic's own capacity, then the protocol's per-clinic cap.
+        let exposure = read_exposure(env, &provider);
+        let capacity = registry.get_capacity(&provider);
+        if capacity > 0 && exposure.vouchers >= capacity {
+            return Err(VoucherError::ProviderAtCapacity);
+        }
+        let escrowed = exposure
+            .value
+            .checked_add(amount)
+            .ok_or(VoucherError::MathOverflow)?;
+        let escrow_cap = read_escrow_cap(env);
+        if escrow_cap > 0 && escrowed > escrow_cap {
+            return Err(VoucherError::EscrowCapReached);
+        }
+
         // Escrow first, record second: if the transfer fails the whole
         // invocation reverts and no voucher is written.
         let escrow = env.current_contract_address();
         let token_client = token::Client::new(env, &config.token);
         token_client.transfer(&funder, &escrow, &amount);
         increase_open_escrow(env, amount)?;
+
+        write_exposure(
+            env,
+            &provider,
+            &Exposure {
+                vouchers: exposure.vouchers + 1,
+                value: escrowed,
+            },
+        );
 
         let id = bump_next_id(env);
         let voucher = Voucher {
@@ -924,6 +994,21 @@ impl VoucherEscrow {
         }
         .publish(env);
         Ok(())
+    }
+
+    /// Takes a voucher that is leaving escrow off its clinic's exposure.
+    /// Saturating, so a voucher funded before tracking existed cannot
+    /// underflow the record.
+    fn release_exposure(env: &Env, voucher: &Voucher) {
+        let exposure = read_exposure(env, &voucher.provider);
+        write_exposure(
+            env,
+            &voucher.provider,
+            &Exposure {
+                vouchers: exposure.vouchers.saturating_sub(1),
+                value: (exposure.value - voucher.amount).max(0),
+            },
+        );
     }
 
     fn refundable_at_for(
@@ -1045,6 +1130,7 @@ impl VoucherEscrow {
 
         voucher.status = VoucherStatus::Settled;
         write_voucher(env, voucher);
+        Self::release_exposure(env, voucher);
 
         ReceiptClient::new(env, &config.receipt_book).mint(
             &escrow,
@@ -1093,6 +1179,9 @@ impl VoucherEscrow {
         if to_funder > 0 {
             Self::send(env, &token_client, &voucher.funder, to_funder)?;
         }
+        // The whole voucher has left escrow, whichever way it was split.
+        decrease_open_escrow(env, voucher.amount)?;
+        Self::release_exposure(env, voucher);
 
         voucher.status = if to_provider == 0 {
             VoucherStatus::Refunded
@@ -1126,6 +1215,7 @@ impl VoucherEscrow {
 
         voucher.status = VoucherStatus::Refunded;
         write_voucher(env, voucher);
+        Self::release_exposure(env, voucher);
 
         VoucherRefunded {
             funder: voucher.funder.clone(),
