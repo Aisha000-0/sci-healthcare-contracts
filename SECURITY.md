@@ -5,7 +5,8 @@
 **These contracts and services are unaudited.** They have not been reviewed by a
 third-party security firm. The current deployment is on Stellar **testnet** only
 and holds no real funds. Do not deploy to mainnet or use with real value until an
-audit has been completed.
+audit has been completed and the
+[mainnet launch checklist](docs/developers/mainnet-checklist.md) is signed off.
 
 ## Reporting a vulnerability
 
@@ -48,6 +49,12 @@ Out of scope:
 - Denial of service against public Soroban RPC endpoints
 - Missing rate limits on read-only endpoints already behind a rate limiter
 - Testnet-only misconfiguration
+
+## If an incident is underway
+
+The [incident response runbook](docs/developers/incident-response.md) is the
+procedure for a live bug or a compromised key: triage, containment with the
+exact contract calls, admin rotation, communication and the post-mortem.
 
 ## Known trust assumptions
 

@@ -1,0 +1,82 @@
+name: E2E local node
+
+# Deploys the contracts to a real Stellar node in local mode, seeds them with
+# the scripts a maintainer runs, and asserts that voucher 1 reaches Attested.
+#
+# Unit tests run in an in-process host, so they never exercise the CLI flags,
+# the RPC or `scripts/deploy.sh` / `scripts/seed.sh`. This job is the only
+# thing that does.
+#
+# It runs on pushes to main rather than on every pull request: it pulls a node
+# image and builds the release wasm, so it is the slowest job in the repo.
+
+on:
+  push:
+    branches: [main]
+  # Lets a maintainer run it by hand, for example after changing a script.
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-local-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  STELLAR_CLI_VERSION: 27.1.0
+  NETWORK: local
+  RPC_URL: http://localhost:8000/soroban/rpc
+
+jobs:
+  local-node:
+    name: deploy and seed on a local node
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      # Standalone network: stellar-core, horizon, soroban-rpc and friendbot on
+      # port 8000. `--local` is the command the image expects; a job service
+      # cannot pass it, which is why this is a plain `docker run`. The script
+      # below waits for the RPC to report healthy before it does anything.
+      - name: Start a local Stellar node
+        run: docker run --rm -d --name stellar -p 8000:8000 stellar/quickstart:latest --local
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: wasm32v1-none
+      - uses: Swatinem/rust-cache@v2
+
+      # The same build release.yml and deploy.sh use, so the wasm this job
+      # deploys is the wasm that gets released.
+      - name: Install wasm-opt
+        run: |
+          curl -sSL "https://github.com/WebAssembly/binaryen/releases/download/version_133/binaryen-version_133-x86_64-linux.tar.gz" \
+            | tar xz
+          sudo install -m755 binaryen-version_133/bin/wasm-opt /usr/local/bin/wasm-opt
+          wasm-opt --version
+
+      - name: Install Stellar CLI
+        run: |
+          curl -sSL "https://github.com/stellar/stellar-cli/releases/download/v$STELLAR_CLI_VERSION/stellar-cli-$STELLAR_CLI_VERSION-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar xz
+          sudo install -m755 stellar /usr/local/bin/stellar
+          stellar --version
+
+      - name: Wait for the node and run the deployment check
+        run: ./scripts/e2e-local.sh
+
+      - name: Show the node's logs on failure
+        if: failure()
+        run: docker logs stellar || true
+
+      - name: Stop the node
+        if: always()
+        run: docker rm -f stellar || true
+
+      - name: Keep the deployment addresses
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: deployment-local-env
+          path: deployments/local.env
+          if-no-files-found: ignore

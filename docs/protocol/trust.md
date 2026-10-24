@@ -21,7 +21,7 @@ These hold regardless of who behaves badly:
 2. **The clinic being paid cannot attest its own delivery.** The contract checks this explicitly and rejects it, even if that clinic address has been granted an attester role.
 3. **A clinic cannot be paid without an attestation.** No path exists from `Funded` or `Claimed` straight to `Settled`.
 4. **Money cannot be released early.** `settle` fails while the dispute window is open.
-5. **An unattested voucher always returns to the funder.** Unclaimed, it is refundable at expiry; claimed but never attested, seven days after expiry. Nobody can prevent that — `refund` needs no authorisation.
+5. **An unattested voucher always returns to the funder.** Unclaimed, it is refundable at expiry — or immediately if the clinic is no longer active. Claimed but never attested, seven days after expiry. Nobody can prevent that — `refund` needs no authorisation.
 6. **The full amount is refunded.** No fee is taken on care that did not happen.
 7. **A settled voucher cannot be settled or refunded again.** Terminal states are terminal.
 8. **Admin rights cannot be handed to a mistyped address.** Every contract transfers administration in two steps — `propose_admin`, then `accept_admin` signed by the new address.
@@ -49,6 +49,16 @@ The admin key is a single point of failure today. Moving it to a multisig is a d
 ### The registry
 
 If a clinic is verified that should not have been, funders can send money to it. Verification is an off-chain process — checking a licence, visiting a site — and the registry only records its outcome.
+
+### The settlement token's issuer
+
+USDC is a regulated stablecoin, and its issuer can **claw back** funds from any balance and **freeze** (deauthorize) one. Escrowed vouchers sit in the voucher contract's own token balance, so the issuer can reach them; nothing in the contract can prevent that. What the contract does is behave predictably when it happens:
+
+- **Clawback.** Before paying anything out, `settle`, `refund`, `resolve_dispute`, `resolve_split` and `reduce_amount` check that the contract still holds the voucher's amount. If it does not, they fail with `EscrowShortfall` (#23) instead of a panic inside the token. Escrow is one balance shared by every open voucher, so a clawback is borne by whichever vouchers draw on it last: earlier ones settle or refund in full, and the rest fail with `EscrowShortfall` until the balance is restored.
+- **Freeze.** If the issuer has frozen the contract, the clinic or the funder, the token refuses the transfer and the call fails with `TokenTransferFailed` (#24).
+- **Nothing is half-paid.** Either error reverts the whole call: the voucher keeps its status, no receipt is minted and no fee is taken. A voucher held up by a freeze settles or refunds normally once the freeze is lifted.
+
+These are covered by the `clawback_*`, `partial_clawback_*` and `frozen_*` tests in `contracts/voucher/src/test.rs`, which run against a Stellar asset contract with clawback and revocation enabled.
 
 ## What the protocol deliberately does not claim
 

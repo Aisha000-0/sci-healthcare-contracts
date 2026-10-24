@@ -1367,6 +1367,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sci-common"
+version = "0.2.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
 name = "sci-faucet"
 version = "0.2.0"
 dependencies = [
@@ -1377,6 +1384,7 @@ dependencies = [
 name = "sci-receipt"
 version = "0.2.0"
 dependencies = [
+ "sci-common",
  "soroban-sdk",
 ]
 
@@ -1384,6 +1392,18 @@ dependencies = [
 name = "sci-registry"
 version = "0.2.0"
 dependencies = [
+ "sci-common",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "sci-sponsor"
+version = "0.2.0"
+dependencies = [
+ "sci-common",
+ "sci-receipt",
+ "sci-registry",
+ "sci-voucher",
  "soroban-sdk",
 ]
 
@@ -1391,6 +1411,7 @@ dependencies = [
 name = "sci-voucher"
 version = "0.2.0"
 dependencies = [
+ "sci-common",
  "sci-receipt",
  "sci-registry",
  "soroban-sdk",

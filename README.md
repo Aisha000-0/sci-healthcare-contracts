@@ -6,10 +6,13 @@
   <a href="https://github.com/Godgift-care/sci-healthcare-contracts/actions/workflows/ci.yml">
     <img src="https://github.com/Godgift-care/sci-healthcare-contracts/actions/workflows/ci.yml/badge.svg" alt="CI" />
   </a>
+  <a href="https://github.com/Godgift-care/sci-healthcare-contracts/actions/workflows/ci.yml?query=job%3Acoverage">
+    <img src="https://github.com/Godgift-care/sci-healthcare-contracts/actions/workflows/ci.yml/badge.svg?job=coverage" alt="coverage" />
+  </a>
   <img src="https://img.shields.io/badge/soroban--sdk-27.0.6-blue" alt="soroban-sdk 27.0.6" />
   <img src="https://img.shields.io/badge/rust-1.96-orange" alt="rust 1.96" />
   <img src="https://img.shields.io/badge/license-Apache--2.0-green" alt="Apache 2.0" />
-  <img src="https://img.shields.io/badge/tests-94%20passing-brightgreen" alt="94 tests" />
+  <img src="https://img.shields.io/badge/tests-195%20passing-brightgreen" alt="195 tests" />
 </p>
 
 # SCI Healthcare — Contracts | [Documentation](https://godgift-care.github.io/sci-healthcare-contracts/)
@@ -61,6 +64,32 @@ Clinics and attesters must be verified by the registry admin, so those roles are
 | Test USDC (SAC) | [`CCRLJ7FEIKTR3GBT3VQQPSIJGRBO2WPNMVFKJDP6AYGJQWECOR4QVE5M`](https://stellar.expert/explorer/testnet/contract/CCRLJ7FEIKTR3GBT3VQQPSIJGRBO2WPNMVFKJDP6AYGJQWECOR4QVE5M) |
 | Test USDC faucet (testnet only) | [`CCB25WG7DQ2CSNXPTOHZO2PDZ324FQPZLH3LSNCCLWYM3FEH52GEXC47`](https://stellar.expert/explorer/testnet/contract/CCB25WG7DQ2CSNXPTOHZO2PDZ324FQPZLH3LSNCCLWYM3FEH52GEXC47) |
 
+### Are those contracts really this source?
+
+Every release attaches the exact wasm that was built, with a `SHA256SUMS` file, and `./scripts/verify-deployments.sh` checks the contracts on chain against a local build:
+
+```bash
+./scripts/verify-deployments.sh testnet
+```
+
+It fetches each deployed wasm with `stellar contract fetch` and compares it with the build in two ways: the SHA-256 of the whole file, and the contract interface (functions, errors and events) as the Stellar host reads it.
+
+**Result on testnet, checked on 2026-10-19 against `main`:**
+
+| Contract | Same bytes | Same interface |
+| --- | --- | --- |
+| Registry | no | yes |
+| Voucher escrow | no | **no** |
+| Care receipts | no | yes |
+| Test USDC faucet | no | yes |
+
+Two separate things are going on, and only one of them is a problem:
+
+- **The bytes differ everywhere, and that is expected.** The contracts on testnet were deployed from an older commit, built on a Windows machine with an unpinned pipeline. The Soroban SDK embeds the absolute path of its own source in its panic messages, so those artefacts carry that machine's paths and a different internal layout. [`scripts/build-wasm.sh`](scripts/build-wasm.sh) now pins the toolchain, takes the local path out of the artefact and optimises with the same `wasm-opt` the release uses, so a build made with it is byte-identical for every builder that uses the same toolchain and the same platform. The contracts on testnet predate that.
+- **The voucher is genuinely older than this repository.** Its lifecycle events do not carry `service_code` and `amount` yet; that change is in the source but was never deployed. Redeploying the voucher with `./scripts/deploy.sh testnet --force` makes it match.
+
+The full recipe, and what "byte-identical" does and does not cover, is in [docs/developers/contracts.md](docs/developers/contracts.md).
+
 ## Architecture
 
 Three contracts, one responsibility each.
@@ -83,11 +112,13 @@ Three contracts, one responsibility each.
                  claim              attest             settle
   Funded ──────────────> Claimed ───────────> Attested ────────> Settled
     │                       │                     │
-    │ refund (past expiry)  │ dispute             │ dispute
-    ▼                       ▼                     ▼
- Refunded  <───────────  Disputed  ──── resolve ──┴──> Settled
-    ▲                       │
-    └───────────────────────┘ refund (claimed, never attested, 7 days past expiry)
+    │ refund                │ dispute             │ dispute
+    │ (expired or           ▼                     ▼
+    │  clinic inactive)  Disputed <───────────────┘
+    ▼                       │
+ Refunded  <──── resolve ────┴──── resolve ────> Settled
+    ▲
+    └── refund (claimed, never attested, 7 days past expiry)
 ```
 
 `settle` and `refund` are **permissionless** — a clinic never depends on the funder or an operator to get paid.
@@ -110,26 +141,88 @@ rustup target add wasm32v1-none
 cargo install --locked stellar-cli
 ```
 
+`wasm-opt` (binaryen) is needed for the release build and for deploying; the
+pinned release is [binaryen 133](https://github.com/WebAssembly/binaryen/releases/tag/version_133):
+
+```bash
+cargo install --locked wasm-opt   # or download the binaryen release above
+```
+
 ### Build and test
 
 ```bash
 git clone https://github.com/Godgift-care/sci-healthcare-contracts
 cd sci-healthcare-contracts
-cargo test                                    # 94 tests
+cargo test                                    # 195 tests
 cargo build --target wasm32v1-none --release  # three .wasm artifacts
+./scripts/build-wasm.sh                       # the release build: optimised wasm + SHA256SUMS
 ```
+
+`scripts/build-wasm.sh` is the build the release workflow and the deployment
+use, so the wasm you build is the wasm that is released and deployed. See
+[docs/developers/contracts.md](docs/developers/contracts.md) for the rules it
+follows.
 
 ### Deploy to testnet
 
 ```bash
 stellar keys generate --network testnet --fund sci-admin
 stellar keys generate --network testnet --fund sci-issuer
-./scripts/deploy.sh testnet     # deploys in dependency order and wires them up
-./scripts/seed.sh testnet       # demo clinic, services, attester, vouchers
-./scripts/deploy-faucet.sh      # testnet only: lets anyone get test USDC
+./scripts/deploy.sh testnet --dry-run   # preview every command; sends nothing
+./scripts/deploy.sh testnet             # deploys in dependency order and wires them up
+./scripts/seed.sh testnet               # demo clinic, services, attester, vouchers
+./scripts/deploy-faucet.sh              # testnet only: lets anyone get test USDC
 ```
 
-`deploy.sh` writes every address to `deployments/testnet.env` and prints a copy-pasteable block for the app's environment.
+`deploy.sh` writes every address to `deployments/testnet.env` and prints a copy-pasteable block for the app's environment. It refuses to overwrite an existing env file unless you pass `--force`, because replacing live addresses breaks the app and indexer. `scripts/test-deploy.sh` tests the refusal, `--force` and `--dry-run` paths.
+
+## What CI checks
+
+| Check | What it catches |
+| --- | --- |
+| `cargo fmt --all -- --check` | formatting drift |
+| `cargo clippy --all-targets --all-features -- -D warnings` | lint warnings |
+| `cargo test --all` | broken behaviour (195 tests) |
+| `cargo llvm-cov` | contract lines the tests never reach |
+| `cargo deny check` | dependencies with a known advisory or an incompatible licence |
+| `./scripts/build-wasm.sh` | a contract that no longer compiles to wasm |
+| `./scripts/test-deploy.sh` | deploy-script overwrite, `--force` and `--dry-run` regressions |
+
+**Coverage.** The `coverage` job prints the coverage table in the job output
+and fails when the contract sources drop below the threshold. Today the
+contracts are at **98.35% of lines** and **97.29% of regions**; the thresholds
+in CI sit just under those numbers, at 98% and 95%. Test files are excluded:
+the number that matters is how much of the contract code the tests reach.
+Raise the threshold in the same pull request that adds the tests.
+
+**Dependencies.** `cargo deny check` runs the RustSec advisory database, the
+licence allow list, the duplicate and wildcard bans and the source allow list.
+The policy lives in [`deny.toml`](deny.toml); there are no exceptions in it
+today, and any future one has to carry a reason.
+
+**Releases.** Pushing a `v*` tag builds the contracts, optimises them with
+`wasm-opt -Oz` and attaches them to the GitHub release together with a
+`SHA256SUMS` file and notes that explain how to compare the hash with a
+deployed contract.
+
+### Run the lifecycle in TypeScript
+
+[`examples/lifecycle.ts`](examples/lifecycle.ts) is the same journey as `seed.sh` — fund, claim, attest, settle — written with [`@stellar/stellar-sdk`](https://github.com/stellar/js-stellar-sdk) and local keys instead of the CLI, and it finishes the story: it waits out the dispute window, calls `settle`, and prints the receipt the contract minted.
+
+```bash
+# from the repository root — a short window lets one run reach settle
+DISPUTE_WINDOW=60 ./scripts/deploy.sh testnet
+cd examples && npm install
+export ADMIN_SECRET=…                            # the seed of your deployment's admin
+npm run lifecycle                                # fund → claim → attest → settle
+npm run lifecycle -- settle <voucher-id>         # finish a voucher later, if the window is long
+```
+
+- Contract ids come from `deployments/testnet.env` (written by `deploy.sh`); `REGISTRY_CONTRACT_ID` and friends override it.
+- `CLINIC_SECRET`, `ATTESTER_SECRET` and `FUNDER_SECRET` are optional — a missing one is generated, printed and friendbotted, so only `ADMIN_SECRET` is required. `ISSUER_SECRET` is needed only when the deployment has no faucet.
+- Activation and attestation are admin-gated, so a full run needs a deployment you control; the shared ids in the table above belong to the maintainer's deployment.
+- Node 18+ is required; the script polyfills the Web Crypto global that older Node versions hide from `tsx`.
+- CI type-checks the example, so it stays working.
 
 ## Contract reference
 
@@ -140,30 +233,37 @@ stellar keys generate --network testnet --fund sci-issuer
 | `initialize(admin)` | once | Sets the administrator |
 | `register_provider(owner, name, country)` | owner | Self-registers a clinic as `Pending` |
 | `set_provider_status(admin, provider, status)` | admin | `Pending` → `Active` → `Suspended` |
-| `upsert_service(provider, code, label, price)` | provider | Lists a billable service; requires `Active` |
+| `upsert_service(provider, code, label, price)` | provider | Lists a billable service or lowers its price; requires `Active` |
+| `schedule_service_price(provider, code, price, effective_at)` | provider | Schedules a price change at least 24 h ahead |
 | `remove_service(provider, code)` | provider | Delists a service |
+| `set_service_available(provider, code, available)` | provider | Pauses or resumes a service without delisting it |
 | `add_attester(admin, attester)` | admin | Grants attester rights |
 | `remove_attester(admin, attester)` | admin | Revokes them |
 | `propose_admin(admin, new_admin)` | admin | Nominates a new admin |
 | `accept_admin(new_admin)` | nominee | Completes the two-step handover |
 | `is_active_provider(provider)` | view | The check `voucher` relies on |
 | `get_service_price(provider, code)` | view | Price, or 0 if absent/inactive |
+| `is_service_available(provider, code)` | view | Listed, active and not paused |
+| `get_upcoming_price(provider, code)` | view | Scheduled price and when it applies, or `(0, 0)` |
 | `is_attester(addr)` | view | Attester check |
 
 ### `voucher`
 
 | Function | Auth | Purpose |
 | --- | --- | --- |
-| `initialize(admin, registry, receipt_book, token, dispute_window, fee_bps, fee_account)` | once | Fixes protocol config; fee capped at 10% |
+| `initialize(admin, registry, receipt_book, token, dispute_window, fee_bps, attester_share_bps, fee_account)` | once | Fixes protocol config; fee capped at 10%, attester share at the fee |
 | `create_voucher(funder, beneficiary_ref, provider, service_code, amount, expires_at)` | funder | Escrows funds against one service at one active provider |
+| `reduce_amount(funder, voucher_id, new_amount)` | funder | Returns an overpayment to the funder while the voucher is still `Funded` |
 | `claim(provider, voucher_id)` | provider | Marks the patient as presented |
 | `attest(attester, voucher_id)` | attester | Confirms delivery; opens the dispute window |
 | `dispute(funder, voucher_id, reason_code)` | funder | Contests before the window closes |
 | `settle(voucher_id)` | none | Releases escrow once the window closes |
-| `refund(voucher_id)` | none | Returns escrow after an unclaimed voucher expires, or 7 days after expiry if claimed but never attested |
+| `refund(voucher_id)` | none | Returns escrow once an unclaimed voucher expires or its clinic is no longer active, or 7 days after expiry if claimed but never attested |
+| `set_attestation_cap(admin, cap)` | admin | Caps attestations per attester per UTC day (default 100) |
 | `refundable_at(voucher_id)` | view | When `refund` will succeed |
 | `propose_admin` / `accept_admin` | admin / nominee | Two-step admin handover |
 | `resolve_dispute(admin, voucher_id, refund_funder)` | admin | Routes escrow to one of the two parties |
+| `resolve_split(admin, voucher_id, to_provider)` | admin | Splits escrow between the clinic, the fee account and the funder |
 | `quote(amount)` | view | `(fee, net)` so a clinic sees exactly what lands |
 
 ### `receipt`
@@ -171,11 +271,31 @@ stellar keys generate --network testnet --fund sci-issuer
 | Function | Auth | Purpose |
 | --- | --- | --- |
 | `initialize(admin, minter)` | once | Sets admin and minter |
-| `set_minter(admin, minter)` | admin | Repoints at a redeployed voucher contract |
+| `propose_minter(admin, new_minter)` | admin | Nominates a new voucher contract |
+| `accept_minter(new_minter)` | new_minter | Completes the handover |
 | `mint(minter, voucher_id, beneficiary_ref, provider, service_code, amount)` | minter | Records a settled episode |
 | `count_for(beneficiary_ref)` | view | Settled episodes for a beneficiary |
+| `provider_stats(provider)` | view | A clinic's receipt count and total paid |
+| `receipts_of_provider(provider, start, limit)` | view | A clinic's receipts in mint order, capped at 50 per page |
 
 There is deliberately no transfer function on receipts.
+
+## Mainnet readiness
+
+The contracts are **unaudited** and the only deployment is on testnet. Before
+mainnet, every gate in the [mainnet launch checklist](docs/developers/mainnet-checklist.md)
+must be signed off with an owner and evidence: audit, code freeze, key custody,
+fee and dispute parameters, monitoring, incident contacts and rollback.
+
+The admin should be a 2-of-3 Stellar multisig account, not one key. The
+[multisig admin guide](docs/developers/multisig-admin.md) creates it, hands all
+three contracts to it through the two-step `propose_admin` / `accept_admin`
+handover, and shows how to submit an admin call with two signatures.
+
+Wallets and remittance apps can add care vouchers without this UI. The
+[integration guide](docs/developers/integration.md) covers deriving a
+beneficiary reference without leaking identity, quoting fees, funding, reading
+status and reading receipts with the JavaScript SDK.
 
 ## Related repositories
 

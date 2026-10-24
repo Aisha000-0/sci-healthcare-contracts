@@ -1,4 +1,9 @@
 #![no_std]
+// A panic aborts the whole invocation with an opaque host error. Contract
+// code must return a typed error instead, so both are denied outside tests.
+// Tests keep them for brevity: they are fail-fast assertions, not contract
+// behaviour.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 //! # SCI Healthcare — Care Vouchers
 //!
@@ -38,21 +43,29 @@ mod storage;
 mod types;
 
 #[cfg(test)]
+mod economics_test;
+#[cfg(test)]
 mod test;
 
-use soroban_sdk::{contract, contractimpl, token, Address, BytesN, Env};
+use sci_common as common;
+use soroban_sdk::{contract, contractimpl, token, Address, Bytes, BytesN, Env, String};
 
 #[allow(unused_imports)]
 pub use events::{
-    AdminChanged, AdminProposed, DisputeResolved, Initialized, VoucherAttested, VoucherClaimed,
-    VoucherCreated, VoucherDisputed, VoucherRefunded, VoucherSettled,
+    AdminChanged, AdminProposed, AttestationCapChanged, DisputeResolved,
+    DisputeWindowBoundsChanged, EscrowCapChanged, Initialized, VoucherAmountReduced,
+    VoucherAttested, VoucherClaimed, VoucherCreated, VoucherDisputed, VoucherRedirected,
+    VoucherRefunded, VoucherSettled,
 };
 pub use interfaces::{ReceiptClient, RegistryClient};
-pub use types::{Config, DataKey, Voucher, VoucherError, VoucherStatus};
+pub use types::{Config, DataKey, Exposure, Voucher, VoucherError, VoucherOptions, VoucherStatus};
 
 use storage::{
-    bump_next_id, clear_pending_admin, extend_instance, has_config, peek_next_id, read_config,
-    read_pending_admin, read_voucher, write_config, write_pending_admin, write_voucher,
+    bump_next_id, decrease_open_escrow, extend_instance, has_config, increase_open_escrow,
+    peek_next_id, read_attestation_cap, read_attestations, read_config, read_dispute_window_bounds,
+    read_escrow_cap, read_exposure, read_open_escrow, read_options, read_voucher,
+    write_attestation_cap, write_attestations, write_config, write_dispute_window_bounds,
+    write_escrow_cap, write_exposure, write_options, write_voucher,
 };
 
 const BPS_DENOMINATOR: i128 = 10_000;
@@ -66,6 +79,22 @@ const MAX_FEE_BPS: u32 = 1_000;
 /// the funder noticed and disputed. The grace period gives an attester
 /// that is merely slow time to confirm care that happened near expiry.
 pub const CLAIM_GRACE_SECS: u64 = 7 * 24 * 60 * 60;
+/// Attestations one attester may make per UTC day until the admin sets
+/// another cap with `set_attestation_cap`.
+///
+/// Limits the blast radius of a stolen attester key: it can confirm at most
+/// this many vouchers before the day ends, buying the admin time to remove
+/// it from the registry.
+pub const DEFAULT_MAX_ATTESTATIONS_PER_DAY: u32 = 100;
+/// Seconds in a UTC day: buckets the per-attester attestation counter.
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+/// Shortest and longest per-voucher dispute window a funder may choose, until
+/// the admin sets others with `set_dispute_window_bounds`: one day to thirty.
+///
+/// The floor keeps a funder from choosing a window too short to notice a bad
+/// attestation in; the ceiling keeps a clinic from waiting indefinitely to be
+/// paid for care it delivered.
+pub const DEFAULT_DISPUTE_WINDOW_BOUNDS: (u64, u64) = (SECONDS_PER_DAY, 30 * SECONDS_PER_DAY);
 
 #[contract]
 pub struct VoucherEscrow;
@@ -83,6 +112,7 @@ impl VoucherEscrow {
         token: Address,
         dispute_window: u64,
         fee_bps: u32,
+        attester_share_bps: u32,
         fee_account: Address,
     ) -> Result<(), VoucherError> {
         if has_config(&env) {
@@ -90,6 +120,11 @@ impl VoucherEscrow {
         }
         if fee_bps > MAX_FEE_BPS {
             return Err(VoucherError::InvalidFee);
+        }
+        // The attester's share is carved out of the protocol fee, so it can
+        // never be larger than the fee itself.
+        if attester_share_bps > fee_bps {
+            return Err(VoucherError::InvalidAttesterShare);
         }
 
         write_config(
@@ -101,6 +136,7 @@ impl VoucherEscrow {
                 token,
                 dispute_window,
                 fee_bps,
+                attester_share_bps,
                 fee_account,
             },
         );
@@ -123,79 +159,64 @@ impl VoucherEscrow {
         amount: i128,
         expires_at: u64,
     ) -> Result<u64, VoucherError> {
-        funder.require_auth();
-
-        if amount <= 0 {
-            return Err(VoucherError::InvalidAmount);
-        }
-        let now = env.ledger().timestamp();
-        if expires_at <= now {
-            return Err(VoucherError::InvalidExpiry);
-        }
-
-        let config = read_config(&env)?;
-        let registry = RegistryClient::new(&env, &config.registry);
-
-        if !registry.is_active_provider(&provider) {
-            return Err(VoucherError::ProviderNotActive);
-        }
-
-        // Zero means the provider does not offer this service, or has
-        // deactivated it.
-        let price = registry.get_service_price(&provider, &service_code);
-        if price == 0 {
-            return Err(VoucherError::ServiceNotOffered);
-        }
-        if amount < price {
-            return Err(VoucherError::AmountBelowPrice);
-        }
-
-        // Escrow first, record second: if the transfer fails the whole
-        // invocation reverts and no voucher is written.
-        let escrow = env.current_contract_address();
-        let token_client = token::Client::new(&env, &config.token);
-        token_client.transfer(&funder, &escrow, &amount);
-
-        let id = bump_next_id(&env);
-        let voucher = Voucher {
-            id,
-            funder: funder.clone(),
-            beneficiary_ref: beneficiary_ref.clone(),
-            provider: provider.clone(),
-            service_code,
-            amount,
-            status: VoucherStatus::Funded,
-            created_at: now,
-            expires_at,
-            claimed_at: 0,
-            attested_at: 0,
-            dispute_deadline: 0,
-        };
-        write_voucher(&env, &voucher);
-
-        VoucherCreated {
+        Self::fund(
+            &env,
             funder,
-            provider,
             beneficiary_ref,
-            voucher_id: id,
+            provider,
             service_code,
             amount,
-            created_at: now,
             expires_at,
-        }
-        .publish(&env);
-        Ok(id)
+            VoucherOptions::default(),
+        )
     }
 
-    /// Provider marks the patient as presented and the service as begun.
+    /// `create_voucher` with optional terms chosen by the funder:
     ///
-    /// A provider suspended after the voucher was funded cannot claim it;
-    /// the voucher simply runs to expiry and refunds.
-    pub fn claim(env: Env, provider: Address, voucher_id: u64) -> Result<(), VoucherError> {
-        provider.require_auth();
+    /// - `presence_commitment`: SHA-256 of a secret the funder gives the
+    ///   patient. The clinic must then claim with `claim_with_proof`,
+    ///   revealing the secret, so a claim shows the clinic had the patient
+    ///   rather than only saying so.
+    /// - `dispute_window`: a dispute window for this voucher, within the
+    ///   bounds (`InvalidDisputeWindow` otherwise). A funder of expensive care
+    ///   can take longer to object; a small voucher can settle sooner.
+    ///
+    /// With both unset this is exactly `create_voucher`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_voucher_with_options(
+        env: Env,
+        funder: Address,
+        beneficiary_ref: BytesN<32>,
+        provider: Address,
+        service_code: u32,
+        amount: i128,
+        expires_at: u64,
+        options: VoucherOptions,
+    ) -> Result<u64, VoucherError> {
+        Self::fund(
+            &env,
+            funder,
+            beneficiary_ref,
+            provider,
+            service_code,
+            amount,
+            expires_at,
+            options,
+        )
+    }
+
+    /// Redirects a funded voucher to another active clinic offering the same
+    /// service for no more than the escrowed amount.
+    pub fn redirect(
+        env: Env,
+        funder: Address,
+        voucher_id: u64,
+        new_provider: Address,
+    ) -> Result<(), VoucherError> {
+        funder.require_auth();
 
         let mut voucher = read_voucher(&env, voucher_id)?;
-        if voucher.provider != provider {
+        if voucher.funder != funder {
             return Err(VoucherError::NotAuthorized);
         }
         if voucher.status != VoucherStatus::Funded {
@@ -203,26 +224,156 @@ impl VoucherEscrow {
         }
 
         let config = read_config(&env)?;
-        if !RegistryClient::new(&env, &config.registry).is_active_provider(&provider) {
+        let registry = RegistryClient::new(&env, &config.registry);
+        if !registry.is_active_provider(&new_provider) {
             return Err(VoucherError::ProviderNotActive);
         }
 
-        let now = env.ledger().timestamp();
-        if now >= voucher.expires_at {
-            return Err(VoucherError::VoucherExpired);
+        let price = registry.get_service_price(&new_provider, &voucher.service_code);
+        if price == 0 {
+            return Err(VoucherError::ServiceNotOffered);
+        }
+        if voucher.amount < price {
+            return Err(VoucherError::AmountBelowPrice);
+        }
+        if !registry.is_service_available(&new_provider, &voucher.service_code) {
+            return Err(VoucherError::ServiceUnavailable);
         }
 
-        voucher.status = VoucherStatus::Claimed;
-        voucher.claimed_at = now;
+        let previous_provider = voucher.provider.clone();
+        voucher.provider = new_provider.clone();
         write_voucher(&env, &voucher);
 
-        VoucherClaimed {
-            provider,
+        VoucherRedirected {
+            funder,
             voucher_id,
-            claimed_at: now,
+            previous_provider,
+            new_provider,
+            service_code: voucher.service_code,
         }
         .publish(&env);
         Ok(())
+    }
+
+    /// Gives back an overpayment without giving up the voucher.
+    ///
+    /// A funder who paid more than the listed price can bring the
+    /// escrowed amount down to the service price and keep the voucher.
+    /// The difference goes straight back to the funder, and no fee is
+    /// taken on money that never became care.
+    ///
+    /// The floor is the price the registry lists **at call time**, so a
+    /// clinic that has raised its price cannot have a funded voucher
+    /// reduced below that price, and a clinic that has lowered it frees
+    /// the funder to reduce further. Only a `Funded` voucher can be
+    /// reduced: once the clinic has claimed it, the escrowed amount is
+    /// what the clinic is expecting to be paid.
+    ///
+    /// Errors:
+    ///
+    /// - `NotAuthorized` — the caller is not the voucher's funder.
+    /// - `InvalidStatus` — the voucher is no longer `Funded`.
+    /// - `InvalidAmount` — `new_amount` is not positive.
+    /// - `AmountNotReduced` — `new_amount` is not below the escrowed amount.
+    /// - `ServiceNotOffered` — the service is no longer listed, so there is
+    ///   no price to reduce towards.
+    /// - `AmountBelowPrice` — `new_amount` is below the current listed price.
+    pub fn reduce_amount(
+        env: Env,
+        funder: Address,
+        voucher_id: u64,
+        new_amount: i128,
+    ) -> Result<(), VoucherError> {
+        funder.require_auth();
+
+        let mut voucher = read_voucher(&env, voucher_id)?;
+        if voucher.funder != funder {
+            return Err(VoucherError::NotAuthorized);
+        }
+        if voucher.status != VoucherStatus::Funded {
+            return Err(VoucherError::InvalidStatus);
+        }
+        if new_amount <= 0 {
+            return Err(VoucherError::InvalidAmount);
+        }
+        if new_amount >= voucher.amount {
+            return Err(VoucherError::AmountNotReduced);
+        }
+
+        let config = read_config(&env)?;
+        // The price at call time is the floor: whatever is left in escrow
+        // must still cover the service.
+        let price = RegistryClient::new(&env, &config.registry)
+            .get_service_price(&voucher.provider, &voucher.service_code);
+        if price == 0 {
+            // The service is no longer listed, so there is no price to
+            // reduce towards. The funder can still refund the voucher at
+            // expiry.
+            return Err(VoucherError::ServiceNotOffered);
+        }
+        if new_amount < price {
+            return Err(VoucherError::AmountBelowPrice);
+        }
+
+        let difference = voucher.amount - new_amount;
+        // Escrow first, record second: if the transfer fails the whole
+        // invocation reverts and the escrowed amount is unchanged.
+        let token_client = token::Client::new(&env, &config.token);
+        Self::ensure_escrow_covers(&env, &token_client, voucher.amount)?;
+        Self::send(&env, &token_client, &funder, difference)?;
+        // The difference has left escrow, so the running total and the
+        // clinic's exposure follow it. The voucher itself stays open.
+        decrease_open_escrow(&env, difference)?;
+        let exposure = read_exposure(&env, &voucher.provider);
+        write_exposure(
+            &env,
+            &voucher.provider,
+            &Exposure {
+                vouchers: exposure.vouchers,
+                value: (exposure.value - difference).max(0),
+            },
+        );
+
+        let previous_amount = voucher.amount;
+        voucher.amount = new_amount;
+        write_voucher(&env, &voucher);
+
+        VoucherAmountReduced {
+            funder,
+            voucher_id,
+            service_code: voucher.service_code,
+            previous_amount,
+            amount: new_amount,
+            refunded: difference,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Provider marks the patient as presented and the service as begun.
+    ///
+    /// A provider suspended after the voucher was funded cannot claim it;
+    /// the voucher can be refunded at once instead of waiting for expiry. A
+    /// voucher funded with a presence commitment is refused
+    /// (`PresenceProofRequired`): it is claimed with `claim_with_proof`.
+    pub fn claim(env: Env, provider: Address, voucher_id: u64) -> Result<(), VoucherError> {
+        Self::claim_voucher(&env, provider, voucher_id, None)
+    }
+
+    /// Claims a voucher funded with a presence commitment by revealing the
+    /// secret behind it. `sha256(secret)` must equal the commitment
+    /// (`InvalidPresenceProof` otherwise); a voucher without one is
+    /// `NoPresenceCommitment`.
+    ///
+    /// The secret becomes public on chain with this call. That is harmless:
+    /// it was only ever good for this one voucher, which this claim uses up.
+    pub fn claim_with_proof(
+        env: Env,
+        provider: Address,
+        voucher_id: u64,
+        secret: Bytes,
+    ) -> Result<(), VoucherError> {
+        Self::claim_voucher(&env, provider, voucher_id, Some(secret))
     }
 
     /// Attests that the service was delivered, opening the dispute window.
@@ -230,6 +381,9 @@ impl VoucherEscrow {
     /// Only a registry attester may call this — deliberately *not* the
     /// provider being paid. Separating the party who gets paid from the
     /// party who confirms delivery is the main check in this protocol.
+    ///
+    /// Each attester may attest at most the attestation cap per UTC day
+    /// (`AttestationCapReached` beyond it); the counter resets at midnight.
     pub fn attest(env: Env, attester: Address, voucher_id: u64) -> Result<(), VoucherError> {
         attester.require_auth();
 
@@ -250,11 +404,22 @@ impl VoucherEscrow {
         }
 
         let now = env.ledger().timestamp();
+        let day = now / SECONDS_PER_DAY;
+        let cap = read_attestation_cap(&env);
+        let attested_today = read_attestations(&env, &attester, day);
+        if attested_today >= cap {
+            return Err(VoucherError::AttestationCapReached);
+        }
+        let attested_today = attested_today + 1;
+        write_attestations(&env, &attester, day, attested_today);
+
         voucher.status = VoucherStatus::Attested;
         voucher.attested_at = now;
-        voucher.dispute_deadline = now
-            .checked_add(config.dispute_window)
-            .ok_or(VoucherError::MathOverflow)?;
+        voucher.attester = Some(attester.clone());
+        let window = read_options(&env, voucher_id)
+            .dispute_window
+            .unwrap_or(config.dispute_window);
+        voucher.dispute_deadline = now.checked_add(window).ok_or(VoucherError::MathOverflow)?;
         write_voucher(&env, &voucher);
 
         VoucherAttested {
@@ -262,6 +427,9 @@ impl VoucherEscrow {
             voucher_id,
             attested_at: now,
             dispute_deadline: voucher.dispute_deadline,
+            service_code: voucher.service_code,
+            amount: voucher.amount,
+            remaining_today: cap - attested_today,
         }
         .publish(&env);
         Ok(())
@@ -302,6 +470,8 @@ impl VoucherEscrow {
             funder,
             voucher_id,
             reason_code,
+            service_code: voucher.service_code,
+            amount: voucher.amount,
         }
         .publish(&env);
         Ok(())
@@ -329,17 +499,22 @@ impl VoucherEscrow {
 
     /// Returns escrow to the funder when care can no longer happen.
     ///
-    /// - A `Funded` voucher is refundable once it expires unclaimed.
+    /// - A `Funded` voucher is refundable once it expires unclaimed, or
+    ///   immediately if its provider is no longer active in the registry.
+    ///   A clinic suspended after the voucher was funded cannot serve it,
+    ///   so the funder should not have to wait for expiry.
     /// - A `Claimed` voucher that was never attested is refundable once
     ///   `CLAIM_GRACE_SECS` have passed after expiry, so a claim alone can
-    ///   never lock the funder's money forever.
+    ///   never lock the funder's money forever. Suspension does not shorten
+    ///   this path: care may already have been given before the clinic was
+    ///   suspended, and an attester may still confirm it.
     ///
     /// Permissionless for the same reason as `settle`.
     pub fn refund(env: Env, voucher_id: u64) -> Result<(), VoucherError> {
         let config = read_config(&env)?;
         let mut voucher = read_voucher(&env, voucher_id)?;
 
-        let refundable_at = Self::refundable_at_for(&voucher)?;
+        let refundable_at = Self::refundable_at_for(&env, &config, &voucher)?;
         if env.ledger().timestamp() < refundable_at {
             return Err(VoucherError::NotYetExpired);
         }
@@ -360,16 +535,15 @@ impl VoucherEscrow {
         refund_funder: bool,
     ) -> Result<(), VoucherError> {
         let config = read_config(&env)?;
-        if config.admin != admin {
-            return Err(VoucherError::NotAuthorized);
-        }
-        admin.require_auth();
+        common::require_admin(&config.admin, &admin)?;
 
         let mut voucher = read_voucher(&env, voucher_id)?;
         if voucher.status != VoucherStatus::Disputed {
             return Err(VoucherError::InvalidStatus);
         }
 
+        let to_provider = if refund_funder { 0 } else { voucher.amount };
+        let fee = Self::fee_for(to_provider, config.fee_bps)?;
         if refund_funder {
             Self::pay_back(&env, &config, &mut voucher)?;
         } else {
@@ -377,11 +551,63 @@ impl VoucherEscrow {
         }
 
         // Published last: the event is only emitted for a resolution whose
-        // transfer actually landed.
+        // transfers actually landed.
         DisputeResolved {
             admin,
             voucher_id,
             refunded_funder: refund_funder,
+            to_provider,
+            fee,
+            to_funder: voucher.amount - to_provider,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Admin resolves a dispute by splitting the escrow between the parties.
+    ///
+    /// `to_provider` is the gross part of the voucher awarded to the clinic,
+    /// from `0` to the voucher amount. The clinic receives `to_provider` minus
+    /// the protocol fee on that part, the fee account receives the fee, and the
+    /// funder receives the rest. The three amounts add up to the voucher amount
+    /// exactly, whatever `to_provider` is.
+    ///
+    /// A split of `0` is a full refund and a split of the whole amount is a
+    /// full payout; in between, the voucher ends `Settled` because some care
+    /// was paid for. A care receipt is minted only when the clinic receives
+    /// something, so no receipt exists for a split that refunds everything.
+    ///
+    /// Like `resolve_dispute`, this is a trusted admin decision, but it can
+    /// still route escrow only to the clinic, the fee account and the funder.
+    pub fn resolve_split(
+        env: Env,
+        admin: Address,
+        voucher_id: u64,
+        to_provider: i128,
+    ) -> Result<(), VoucherError> {
+        let config = read_config(&env)?;
+        common::require_admin(&config.admin, &admin)?;
+
+        let mut voucher = read_voucher(&env, voucher_id)?;
+        if voucher.status != VoucherStatus::Disputed {
+            return Err(VoucherError::InvalidStatus);
+        }
+        if to_provider < 0 || to_provider > voucher.amount {
+            return Err(VoucherError::InvalidAmount);
+        }
+
+        let fee = Self::fee_for(to_provider, config.fee_bps)?;
+        let to_funder = voucher.amount - to_provider;
+
+        Self::pay_split(&env, &config, &mut voucher, to_provider, fee, to_funder)?;
+
+        DisputeResolved {
+            admin,
+            voucher_id,
+            refunded_funder: to_provider == 0,
+            to_provider,
+            fee,
+            to_funder,
         }
         .publish(&env);
         Ok(())
@@ -395,13 +621,9 @@ impl VoucherEscrow {
     /// dispute resolution. Proposing again replaces the earlier nominee.
     pub fn propose_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), VoucherError> {
         let config = read_config(&env)?;
-        if config.admin != admin {
-            return Err(VoucherError::NotAuthorized);
-        }
-        admin.require_auth();
+        common::require_admin(&config.admin, &admin)?;
 
-        write_pending_admin(&env, &new_admin);
-        extend_instance(&env);
+        common::propose_admin(&env, &DataKey::PendingAdmin, &new_admin);
         AdminProposed {
             admin,
             pending_admin: new_admin,
@@ -412,35 +634,158 @@ impl VoucherEscrow {
 
     /// The nominated address accepts and becomes admin.
     pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), VoucherError> {
-        let pending = read_pending_admin(&env).ok_or(VoucherError::NoPendingAdmin)?;
-        if pending != new_admin {
-            return Err(VoucherError::NotAuthorized);
-        }
-        new_admin.require_auth();
+        let new_admin = common::take_pending_admin(&env, &DataKey::PendingAdmin, &new_admin)?;
 
         let mut config = read_config(&env)?;
         config.admin = new_admin.clone();
         write_config(&env, &config);
-        clear_pending_admin(&env);
-        extend_instance(&env);
         AdminChanged { new_admin }.publish(&env);
+        Ok(())
+    }
+
+    /// Sets how many attestations one attester may make per UTC day.
+    ///
+    /// Takes effect at once, including for today's count. Must be at least
+    /// 1: to stop an attester entirely, remove it from the registry.
+    pub fn set_attestation_cap(env: Env, admin: Address, cap: u32) -> Result<(), VoucherError> {
+        let config = read_config(&env)?;
+        common::require_admin(&config.admin, &admin)?;
+        if cap == 0 {
+            return Err(VoucherError::InvalidAttestationCap);
+        }
+
+        write_attestation_cap(&env, cap);
+        extend_instance(&env);
+        AttestationCapChanged { admin, cap }.publish(&env);
+        Ok(())
+    }
+
+    /// Sets the range a funder's per-voucher dispute window must fall in.
+    ///
+    /// `min` must be at least 1 and no more than `max`
+    /// (`InvalidDisputeWindow`). Affects vouchers funded afterwards; a voucher
+    /// keeps the window it was funded with.
+    pub fn set_dispute_window_bounds(
+        env: Env,
+        admin: Address,
+        min: u64,
+        max: u64,
+    ) -> Result<(), VoucherError> {
+        let config = read_config(&env)?;
+        common::require_admin(&config.admin, &admin)?;
+        if min == 0 || min > max {
+            return Err(VoucherError::InvalidDisputeWindow);
+        }
+
+        write_dispute_window_bounds(&env, (min, max));
+        extend_instance(&env);
+        DisputeWindowBoundsChanged { admin, min, max }.publish(&env);
+        Ok(())
+    }
+
+    /// Sets the most value one clinic may hold in escrow at once, across all
+    /// its open vouchers. `0` means unlimited, the default.
+    ///
+    /// A limit on loss while clinic verification is young: if a verified
+    /// clinic turns out to be fraudulent, at most this much is exposed to it.
+    /// Takes effect for new vouchers only; vouchers already funded settle or
+    /// refund as normal even if the clinic is above a lowered cap.
+    pub fn set_max_escrow_per_provider(
+        env: Env,
+        admin: Address,
+        max: i128,
+    ) -> Result<(), VoucherError> {
+        let config = read_config(&env)?;
+        common::require_admin(&config.admin, &admin)?;
+        if max < 0 {
+            return Err(VoucherError::InvalidEscrowCap);
+        }
+
+        write_escrow_cap(&env, max);
+        extend_instance(&env);
+        EscrowCapChanged { admin, max }.publish(&env);
         Ok(())
     }
 
     // ----- views -----
 
+    /// `(min, max)` seconds a funder's per-voucher dispute window may take.
+    pub fn get_dispute_window_bounds(env: Env) -> (u64, u64) {
+        read_dispute_window_bounds(&env)
+    }
+
+    /// The options a voucher was funded with; all off for a plain voucher.
+    pub fn get_voucher_options(env: Env, voucher_id: u64) -> Result<VoucherOptions, VoucherError> {
+        read_voucher(&env, voucher_id)?;
+        Ok(read_options(&env, voucher_id))
+    }
+
+    /// Most value one clinic may hold in escrow at once; `0` is unlimited.
+    pub fn get_max_escrow_per_provider(env: Env) -> i128 {
+        read_escrow_cap(&env)
+    }
+
+    /// The clinic's open vouchers: how many, and how much they escrow.
+    pub fn get_exposure(env: Env, provider: Address) -> Exposure {
+        read_exposure(&env, &provider)
+    }
+
+    /// Most attestations one attester may make per UTC day.
+    pub fn get_attestation_cap(env: Env) -> u32 {
+        read_attestation_cap(&env)
+    }
+
+    /// Attestations `attester` may still make today (UTC).
+    pub fn attestations_left(env: Env, attester: Address) -> u32 {
+        let day = env.ledger().timestamp() / SECONDS_PER_DAY;
+        read_attestation_cap(&env).saturating_sub(read_attestations(&env, &attester, day))
+    }
+
     pub fn get_pending_admin(env: Env) -> Option<Address> {
-        read_pending_admin(&env)
+        common::read_pending_admin(&env, &DataKey::PendingAdmin)
     }
 
     /// Earliest ledger time at which `refund` will succeed, or
     /// `InvalidStatus` if this voucher can no longer be refunded.
+    ///
+    /// A funded voucher whose provider is no longer active returns the
+    /// current ledger time: it is refundable now, before expiry.
     pub fn refundable_at(env: Env, voucher_id: u64) -> Result<u64, VoucherError> {
-        Self::refundable_at_for(&read_voucher(&env, voucher_id)?)
+        let voucher = read_voucher(&env, voucher_id)?;
+        let config = read_config(&env)?;
+        Self::refundable_at_for(&env, &config, &voucher)
     }
 
     pub fn get_voucher(env: Env, voucher_id: u64) -> Result<Voucher, VoucherError> {
         read_voucher(&env, voucher_id)
+    }
+
+    /// The fields `sponsor` needs to match this voucher, in one call.
+    ///
+    /// `(beneficiary_ref, funder, provider, service_code, amount, status,
+    /// created_at, expires_at)`, where `status` is the voucher's
+    /// `VoucherStatus` as a number: 0 `Funded`, 1 `Claimed`, 2 `Attested`,
+    /// 3 `Settled`, 4 `Disputed`, 5 `Refunded`. `None` when the voucher
+    /// does not exist.
+    ///
+    /// Declared over primitives so the two contracts share no types and can
+    /// be upgraded independently.
+    #[allow(clippy::type_complexity)]
+    pub fn voucher_summary(
+        env: Env,
+        voucher_id: u64,
+    ) -> Option<(BytesN<32>, Address, Address, u32, i128, u32, u64, u64)> {
+        let voucher = read_voucher(&env, voucher_id).ok()?;
+        Some((
+            voucher.beneficiary_ref,
+            voucher.funder,
+            voucher.provider,
+            voucher.service_code,
+            voucher.amount,
+            voucher.status as u32,
+            voucher.created_at,
+            voucher.expires_at,
+        ))
     }
 
     pub fn get_config(env: Env) -> Result<Config, VoucherError> {
@@ -459,11 +804,239 @@ impl VoucherEscrow {
         Ok((fee, amount - fee))
     }
 
+    /// Read-only solvency check: `(open_escrow, token_balance)`.
+    ///
+    /// `open_escrow` is the running total of amounts belonging to vouchers
+    /// that have been funded and not yet settled or refunded. `token_balance`
+    /// is the contract's actual balance of the settlement token. The two are
+    /// equal when the accounting is correct; anything else is a bug or tokens
+    /// sent to the contract outside a voucher.
+    ///
+    /// No authorisation: anyone may run the check.
+    pub fn escrow_summary(env: Env) -> Result<(i128, i128), VoucherError> {
+        let config = read_config(&env)?;
+        let open_escrow = read_open_escrow(&env);
+        let token_balance =
+            token::Client::new(&env, &config.token).balance(&env.current_contract_address());
+        Ok((open_escrow, token_balance))
+    }
+
+    /// Crate version this contract was built from, e.g. `"0.2.0"`.
+    ///
+    /// Lets integrators and the indexer tell deployments apart without
+    /// comparing wasm hashes.
+    pub fn version(env: Env) -> String {
+        String::from_str(&env, env!("CARGO_PKG_VERSION"))
+    }
+
     // ----- internal -----
 
-    fn refundable_at_for(voucher: &Voucher) -> Result<u64, VoucherError> {
+    /// Validates and escrows a new voucher. Shared by `create_voucher` and
+    /// `create_voucher_with_options`.
+    #[allow(clippy::too_many_arguments)]
+    fn fund(
+        env: &Env,
+        funder: Address,
+        beneficiary_ref: BytesN<32>,
+        provider: Address,
+        service_code: u32,
+        amount: i128,
+        expires_at: u64,
+        options: VoucherOptions,
+    ) -> Result<u64, VoucherError> {
+        funder.require_auth();
+
+        if amount <= 0 {
+            return Err(VoucherError::InvalidAmount);
+        }
+        let now = env.ledger().timestamp();
+        if expires_at <= now {
+            return Err(VoucherError::InvalidExpiry);
+        }
+        if let Some(window) = options.dispute_window {
+            let (min, max) = read_dispute_window_bounds(env);
+            if window < min || window > max {
+                return Err(VoucherError::InvalidDisputeWindow);
+            }
+        }
+
+        let config = read_config(env)?;
+        let registry = RegistryClient::new(env, &config.registry);
+
+        if !registry.is_active_provider(&provider) {
+            return Err(VoucherError::ProviderNotActive);
+        }
+
+        // Zero means the provider does not offer this service, or has
+        // deactivated it.
+        let price = registry.get_service_price(&provider, &service_code);
+        if price == 0 {
+            return Err(VoucherError::ServiceNotOffered);
+        }
+        if amount < price {
+            return Err(VoucherError::AmountBelowPrice);
+        }
+        // Listed, but paused by the clinic (e.g. out of test kits).
+        if !registry.is_service_available(&provider, &service_code) {
+            return Err(VoucherError::ServiceUnavailable);
+        }
+
+        // The clinic's own capacity, then the protocol's per-clinic cap.
+        let exposure = read_exposure(env, &provider);
+        let capacity = registry.get_capacity(&provider);
+        if capacity > 0 && exposure.vouchers >= capacity {
+            return Err(VoucherError::ProviderAtCapacity);
+        }
+        let escrowed = exposure
+            .value
+            .checked_add(amount)
+            .ok_or(VoucherError::MathOverflow)?;
+        let escrow_cap = read_escrow_cap(env);
+        if escrow_cap > 0 && escrowed > escrow_cap {
+            return Err(VoucherError::EscrowCapReached);
+        }
+
+        // Escrow first, record second: if the transfer fails the whole
+        // invocation reverts and no voucher is written.
+        let escrow = env.current_contract_address();
+        let token_client = token::Client::new(env, &config.token);
+        token_client.transfer(&funder, &escrow, &amount);
+        increase_open_escrow(env, amount)?;
+
+        write_exposure(
+            env,
+            &provider,
+            &Exposure {
+                vouchers: exposure.vouchers + 1,
+                value: escrowed,
+            },
+        );
+
+        let id = bump_next_id(env);
+        let voucher = Voucher {
+            id,
+            funder: funder.clone(),
+            beneficiary_ref: beneficiary_ref.clone(),
+            provider: provider.clone(),
+            service_code,
+            amount,
+            status: VoucherStatus::Funded,
+            created_at: now,
+            expires_at,
+            claimed_at: 0,
+            attested_at: 0,
+            dispute_deadline: 0,
+            attester: None,
+        };
+        write_voucher(env, &voucher);
+        write_options(env, id, &options);
+
+        VoucherCreated {
+            funder,
+            provider,
+            beneficiary_ref,
+            voucher_id: id,
+            service_code,
+            amount,
+            created_at: now,
+            expires_at,
+        }
+        .publish(env);
+        Ok(id)
+    }
+
+    /// Claims a voucher, with the presence secret when it has a commitment.
+    fn claim_voucher(
+        env: &Env,
+        provider: Address,
+        voucher_id: u64,
+        secret: Option<Bytes>,
+    ) -> Result<(), VoucherError> {
+        provider.require_auth();
+
+        let mut voucher = read_voucher(env, voucher_id)?;
+        if voucher.provider != provider {
+            return Err(VoucherError::NotAuthorized);
+        }
+        if voucher.status != VoucherStatus::Funded {
+            return Err(VoucherError::InvalidStatus);
+        }
+
+        match (read_options(env, voucher_id).presence_commitment, secret) {
+            (None, None) => {}
+            (Some(_), None) => return Err(VoucherError::PresenceProofRequired),
+            (None, Some(_)) => return Err(VoucherError::NoPresenceCommitment),
+            (Some(commitment), Some(secret)) => {
+                let digest: BytesN<32> = env.crypto().sha256(&secret).into();
+                if digest != commitment {
+                    return Err(VoucherError::InvalidPresenceProof);
+                }
+            }
+        }
+
+        let config = read_config(env)?;
+        if !RegistryClient::new(env, &config.registry).is_active_provider(&provider) {
+            return Err(VoucherError::ProviderNotActive);
+        }
+
+        let now = env.ledger().timestamp();
+        if now >= voucher.expires_at {
+            return Err(VoucherError::VoucherExpired);
+        }
+
+        voucher.status = VoucherStatus::Claimed;
+        voucher.claimed_at = now;
+        write_voucher(env, &voucher);
+
+        VoucherClaimed {
+            provider,
+            voucher_id,
+            claimed_at: now,
+            service_code: voucher.service_code,
+            amount: voucher.amount,
+        }
+        .publish(env);
+        Ok(())
+    }
+
+    /// Takes a voucher that is leaving escrow off its clinic's exposure.
+    /// Saturating, so a voucher funded before tracking existed cannot
+    /// underflow the record.
+    fn release_exposure(env: &Env, voucher: &Voucher) {
+        let exposure = read_exposure(env, &voucher.provider);
+        write_exposure(
+            env,
+            &voucher.provider,
+            &Exposure {
+                vouchers: exposure.vouchers.saturating_sub(1),
+                value: (exposure.value - voucher.amount).max(0),
+            },
+        );
+    }
+
+    fn refundable_at_for(
+        env: &Env,
+        config: &Config,
+        voucher: &Voucher,
+    ) -> Result<u64, VoucherError> {
         match voucher.status {
-            VoucherStatus::Funded => Ok(voucher.expires_at),
+            VoucherStatus::Funded => {
+                let now = env.ledger().timestamp();
+                // Keep the ordinary expiry path free of a cross-contract
+                // call, so a registry problem can never block a refund that
+                // was already due. Only a voucher still inside its validity
+                // needs the registry to decide whether the clinic can serve
+                // it at all.
+                if now >= voucher.expires_at {
+                    Ok(voucher.expires_at)
+                } else if !RegistryClient::new(env, &config.registry)
+                    .is_active_provider(&voucher.provider)
+                {
+                    Ok(now)
+                } else {
+                    Ok(voucher.expires_at)
+                }
+            }
             VoucherStatus::Claimed => voucher
                 .expires_at
                 .checked_add(CLAIM_GRACE_SECS)
@@ -475,123 +1048,203 @@ impl VoucherEscrow {
     /// Basis-point fee. Integer math throughout; truncation favours the
     /// provider, never the protocol.
     fn fee_for(amount: i128, fee_bps: u32) -> Result<i128, VoucherError> {
+        Self::bps_of(amount, fee_bps)
+    }
+
+    /// Share of `amount` in basis points, rounded down.
+    fn bps_of(amount: i128, bps: u32) -> Result<i128, VoucherError> {
         amount
-            .checked_mul(fee_bps as i128)
+            .checked_mul(bps as i128)
             .ok_or(VoucherError::MathOverflow)?
             .checked_div(BPS_DENOMINATOR)
             .ok_or(VoucherError::MathOverflow)
     }
 
-    /// Pays the provider, takes the fee, and mints the care receipt.
+    /// Fails with `EscrowShortfall` when the contract holds less of the token
+    /// than `amount`.
     ///
-    /// The order is deliberate and is the same on every path:
+    /// Escrow is one token balance shared by every open voucher, so this can
+    /// only happen if the issuer clawed funds back from the contract. Checking
+    /// first turns what would be a host panic deep inside the token into a
+    /// defined error, and the whole invocation reverts: nothing is half-paid.
+    fn ensure_escrow_covers(
+        env: &Env,
+        token_client: &token::Client,
+        amount: i128,
+    ) -> Result<(), VoucherError> {
+        if token_client.balance(&env.current_contract_address()) < amount {
+            return Err(VoucherError::EscrowShortfall);
+        }
+        Ok(())
+    }
+
+    /// Moves `amount` out of escrow, turning a refused transfer — a frozen
+    /// (deauthorized) escrow or recipient — into `TokenTransferFailed`.
     ///
-    /// 1. **Effects first.** The voucher is written `Settled` before any
-    ///    external call, so a token — or a provider address that is a
-    ///    contract — that re-enters `settle` from inside the transfer sees a
-    ///    terminal status and cannot be paid a second time.
-    /// 2. **Interactions, each checked.** Both token transfers and the
-    ///    receipt mint are reported as typed errors instead of opaque host
-    ///    failures, and each transfer is measured: the escrow's balance must
-    ///    fall by exactly the amount sent, so a token that returns success
-    ///    without moving funds cannot mark a voucher paid.
-    /// 3. **Event last**, so `voucher_settled` is only emitted for a
-    ///    settlement that actually moved money.
+    /// The escrow's balance must also fall by exactly `amount`, so a token
+    /// that reports success without moving funds cannot mark a voucher paid.
+    fn send(
+        env: &Env,
+        token_client: &token::Client,
+        to: &Address,
+        amount: i128,
+    ) -> Result<(), VoucherError> {
+        let escrow = env.current_contract_address();
+        let before = token_client.balance(&escrow);
+        match token_client.try_transfer(&escrow, to, &amount) {
+            Ok(Ok(())) => {}
+            _ => return Err(VoucherError::TokenTransferFailed),
+        }
+        if before - token_client.balance(&escrow) != amount {
+            return Err(VoucherError::TokenTransferFailed);
+        }
+        Ok(())
+    }
+
+    /// Mints the care receipt, turning a refusal by the receipt book into
+    /// `ReceiptMintFailed` so the whole settlement rolls back.
+    fn mint_receipt(
+        env: &Env,
+        config: &Config,
+        voucher: &Voucher,
+        amount: i128,
+    ) -> Result<(), VoucherError> {
+        let minted = ReceiptClient::new(env, &config.receipt_book).try_mint(
+            &env.current_contract_address(),
+            &voucher.id,
+            &voucher.beneficiary_ref,
+            &voucher.provider,
+            &voucher.service_code,
+            &amount,
+        );
+        match minted {
+            Ok(Ok(())) => Ok(()),
+            _ => Err(VoucherError::ReceiptMintFailed),
+        }
+    }
+
+    /// Pays the provider, splits the fee between the attester and the fee
+    /// account, and mints the care receipt.
     ///
-    /// Any `Err` rolls the whole invocation back, including the status
-    /// write: a failed transfer or a failed mint leaves the voucher
-    /// `Attested` and the escrow untouched.
+    /// `Config` guarantees `attester_share_bps <= fee_bps`, so the attester
+    /// share can never exceed the fee and the three payouts always sum to the
+    /// voucher amount exactly:
+    ///
+    /// ```text
+    /// net             = amount - fee
+    /// attester_share  = amount * attester_share_bps / 10_000
+    /// fee_account     = fee - attester_share
+    /// ```
+    ///
+    /// A voucher attested before attesters were stored has no attester to pay,
+    /// so the whole fee goes to the fee account, as it did before.
     fn pay_out(env: &Env, config: &Config, voucher: &mut Voucher) -> Result<(), VoucherError> {
         let fee = Self::fee_for(voucher.amount, config.fee_bps)?;
-        let net = voucher
-            .amount
-            .checked_sub(fee)
-            .ok_or(VoucherError::MathOverflow)?;
+        let net = voucher.amount - fee;
+        let attester_share = match &voucher.attester {
+            Some(_) => Self::bps_of(voucher.amount, config.attester_share_bps)?,
+            None => 0,
+        };
+        let fee_account_share = fee - attester_share;
 
+        let token_client = token::Client::new(env, &config.token);
+
+        // Effects first: a token or provider contract that re-enters from
+        // inside a transfer sees a settled voucher and cannot be paid twice.
+        // Any error below rolls the whole call back, status included.
         voucher.status = VoucherStatus::Settled;
         write_voucher(env, voucher);
 
-        let escrow = env.current_contract_address();
-        let token_client = token::Client::new(env, &config.token);
-
-        let paid = Self::transfer_from_escrow(&token_client, &escrow, &voucher.provider, net)?;
-        if paid != net {
-            return Err(VoucherError::TokenTransferFailed);
-        }
-        if fee > 0 {
-            let taken =
-                Self::transfer_from_escrow(&token_client, &escrow, &config.fee_account, fee)?;
-            if taken != fee {
-                return Err(VoucherError::TokenTransferFailed);
+        Self::ensure_escrow_covers(env, &token_client, voucher.amount)?;
+        Self::send(env, &token_client, &voucher.provider, net)?;
+        if let Some(attester) = &voucher.attester {
+            if attester_share > 0 {
+                Self::send(env, &token_client, attester, attester_share)?;
             }
         }
-
-        let receipts = ReceiptClient::new(env, &config.receipt_book);
-        if receipts
-            .try_mint(
-                &escrow,
-                &voucher.id,
-                &voucher.beneficiary_ref,
-                &voucher.provider,
-                &voucher.service_code,
-                &voucher.amount,
-            )
-            .is_err()
-        {
-            return Err(VoucherError::ReceiptMintFailed);
+        if fee_account_share > 0 {
+            Self::send(env, &token_client, &config.fee_account, fee_account_share)?;
         }
+        decrease_open_escrow(env, voucher.amount)?;
+        Self::release_exposure(env, voucher);
+
+        Self::mint_receipt(env, config, voucher, voucher.amount)?;
 
         VoucherSettled {
             provider: voucher.provider.clone(),
             voucher_id: voucher.id,
             net,
             fee,
-        }
-        .publish(env);
-        Ok(())
-    }
-
-    /// Returns the full escrowed amount to the funder. No fee is taken on
-    /// care that never happened.
-    ///
-    /// Same ordering as `pay_out`: status first, then a checked transfer,
-    /// then the event. A refused or silent transfer returns an error and the
-    /// refund — status included — rolls back.
-    fn pay_back(env: &Env, config: &Config, voucher: &mut Voucher) -> Result<(), VoucherError> {
-        voucher.status = VoucherStatus::Refunded;
-        write_voucher(env, voucher);
-
-        let escrow = env.current_contract_address();
-        let token_client = token::Client::new(env, &config.token);
-        let returned =
-            Self::transfer_from_escrow(&token_client, &escrow, &voucher.funder, voucher.amount)?;
-        if returned != voucher.amount {
-            return Err(VoucherError::TokenTransferFailed);
-        }
-
-        VoucherRefunded {
-            funder: voucher.funder.clone(),
-            voucher_id: voucher.id,
+            attester_share,
+            service_code: voucher.service_code,
             amount: voucher.amount,
         }
         .publish(env);
         Ok(())
     }
 
-    /// Sends `amount` out of escrow and returns how far the escrow's balance
-    /// actually fell, so the caller can check the token moved what it said it
-    /// moved. Returns `TokenTransferFailed` if the token refuses the call.
-    fn transfer_from_escrow(
-        token_client: &token::Client<'_>,
-        escrow: &Address,
-        to: &Address,
-        amount: i128,
-    ) -> Result<i128, VoucherError> {
-        let before = token_client.balance(escrow);
-        if token_client.try_transfer(escrow, to, &amount).is_err() {
-            return Err(VoucherError::TokenTransferFailed);
+    /// Pays a resolved dispute in parts: `to_provider` gross to the clinic
+    /// (minus its fee), the fee to the fee account and `to_funder` back to the
+    /// funder. The caller has already checked that the parts add up.
+    fn pay_split(
+        env: &Env,
+        config: &Config,
+        voucher: &mut Voucher,
+        to_provider: i128,
+        fee: i128,
+        to_funder: i128,
+    ) -> Result<(), VoucherError> {
+        let net = to_provider - fee;
+        let token_client = token::Client::new(env, &config.token);
+
+        voucher.status = if to_provider == 0 {
+            VoucherStatus::Refunded
+        } else {
+            VoucherStatus::Settled
+        };
+        write_voucher(env, voucher);
+
+        Self::ensure_escrow_covers(env, &token_client, voucher.amount)?;
+        if net > 0 {
+            Self::send(env, &token_client, &voucher.provider, net)?;
         }
-        let after = token_client.balance(escrow);
-        before.checked_sub(after).ok_or(VoucherError::MathOverflow)
+        if fee > 0 {
+            Self::send(env, &token_client, &config.fee_account, fee)?;
+        }
+        if to_funder > 0 {
+            Self::send(env, &token_client, &voucher.funder, to_funder)?;
+        }
+        // The whole voucher has left escrow, whichever way it was split.
+        decrease_open_escrow(env, voucher.amount)?;
+        Self::release_exposure(env, voucher);
+
+        // No care was paid for when the split sends everything back, so no
+        // receipt is minted and the beneficiary's episode count stays put.
+        if to_provider > 0 {
+            Self::mint_receipt(env, config, voucher, to_provider)?;
+        }
+        Ok(())
+    }
+
+    /// Returns the full escrowed amount to the funder. No fee is taken on
+    /// care that never happened.
+    fn pay_back(env: &Env, config: &Config, voucher: &mut Voucher) -> Result<(), VoucherError> {
+        let token_client = token::Client::new(env, &config.token);
+        voucher.status = VoucherStatus::Refunded;
+        write_voucher(env, voucher);
+
+        Self::ensure_escrow_covers(env, &token_client, voucher.amount)?;
+        Self::send(env, &token_client, &voucher.funder, voucher.amount)?;
+        decrease_open_escrow(env, voucher.amount)?;
+        Self::release_exposure(env, voucher);
+
+        VoucherRefunded {
+            funder: voucher.funder.clone(),
+            voucher_id: voucher.id,
+            amount: voucher.amount,
+            service_code: voucher.service_code,
+        }
+        .publish(env);
+        Ok(())
     }
 }

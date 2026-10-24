@@ -1,0 +1,32 @@
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    # Rust workspace: Cargo.toml at the repo root pins soroban-sdk and the
+    # path dependencies of the four contracts.
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # Open pull requests for dependency updates once a week, grouped so a
+    # single soroban-sdk bump does not generate noise across the workspace.
+    groups:
+      soroban-sdk:
+        patterns:
+          - "soroban-sdk"
+    labels:
+      - "dependencies"
+      - "soroban-sdk-review"
+    # soroban-sdk upgrades touch the build and the released wasm bytes, so
+    # they deserve careful review before merging.
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "chore(deps)"
+
+  - package-ecosystem: "github-actions"
+    # GitHub Actions workflows under .github/workflows/.
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore(deps)"

@@ -5,6 +5,8 @@ nav_order: 7
 
 # Running a clinic
 
+🇫🇷 [Lire ce guide en français](../fr/clinics.md) · 🇰🇪🇹🇿 [Soma mwongozo huu kwa Kiswahili](../sw/clinics.md)
+
 You are a clinic, pharmacy or lab that wants to be paid through the protocol.
 
 ## Getting verified
@@ -46,3 +48,7 @@ You receive the voucher amount less the 1% protocol fee. A $3.00 voucher pays yo
 **Suspension.** An administrator can suspend a clinic. A suspended clinic cannot receive new vouchers or change prices. Vouchers already funded still settle normally.
 
 **Getting local currency.** Settlement is in USDC. Converting to naira, shillings or cash goes through a Stellar anchor — Yellowcard, Cowrie, HoneyCoin, MoneyGram. That is a separate, regulated step with its own identity checks. The in-app handoff is [an open issue](https://github.com/Godgift-care/sci-healthcare-frontend/issues), not yet built.
+
+## More questions
+
+See the [Clinic FAQ](clinics-faq.md) for payment timing, disputes, fees and other common questions, each with links to the source.

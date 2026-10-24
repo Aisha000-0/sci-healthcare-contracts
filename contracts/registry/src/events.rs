@@ -52,9 +52,40 @@ pub struct ServiceRemoved {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServicePriceScheduled {
+    #[topic]
+    pub provider: Address,
+    #[topic]
+    pub code: u32,
+    pub price: i128,
+    pub effective_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceAvailabilityChanged {
+    #[topic]
+    pub provider: Address,
+    #[topic]
+    pub code: u32,
+    pub available: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttesterAdded {
     #[topic]
     pub attester: Address,
+}
+
+/// A clinic declared how many vouchers it can have outstanding at once.
+/// `max_outstanding` is 0 for unlimited.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapacityChanged {
+    #[topic]
+    pub provider: Address,
+    pub max_outstanding: u32,
 }
 
 #[contractevent]

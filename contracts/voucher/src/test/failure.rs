@@ -232,18 +232,18 @@ fn setup(token_choice: TokenChoice, receipt_choice: ReceiptChoice) -> Fixture {
     let registry = RegistryClient::new(&env, &registry_addr);
     registry.initialize(&admin);
 
+    // The voucher contract exists first so the receipt book can name it as
+    // minter at initialisation, the order scripts/deploy.sh uses.
+    let escrow = env.register(VoucherEscrow, ());
+    let voucher = VoucherEscrowClient::new(&env, &escrow);
     let receipt_addr = match receipt_choice {
         ReceiptChoice::Real => {
             let addr = env.register(ReceiptBook, ());
-            // Minter is repointed at the voucher contract below.
-            ReceiptBookClient::new(&env, &addr).initialize(&admin, &admin);
+            ReceiptBookClient::new(&env, &addr).initialize(&admin, &escrow);
             addr
         }
         ReceiptChoice::Rejecting => env.register(MockReceiptBook, ()),
     };
-
-    let escrow = env.register(VoucherEscrow, ());
-    let voucher = VoucherEscrowClient::new(&env, &escrow);
     voucher.initialize(
         &admin,
         &registry_addr,
@@ -251,11 +251,9 @@ fn setup(token_choice: TokenChoice, receipt_choice: ReceiptChoice) -> Fixture {
         &token_addr,
         &DISPUTE_WINDOW,
         &FEE_BPS,
+        &0u32,
         &fee_account,
     );
-    if let ReceiptChoice::Real = receipt_choice {
-        ReceiptBookClient::new(&env, &receipt_addr).set_minter(&admin, &escrow);
-    }
 
     registry.register_provider(
         &provider,
